@@ -149,12 +149,15 @@ def _stdout_supports_color() -> bool:
 
 
 def _welcome_art_lines(colored: bool) -> tuple[str, ...]:
-    """对称 ASCII 猫头横幅；交互式终端下可使用 ANSI 多色高亮。"""
+    """对称 ASCII 蚂蚁横幅；交互式终端下可使用 ANSI 多色高亮。"""
     plain = (
-        "      .-----.      ",
-        "     / o   o \\     ",
-        "     |   ^   |     ",
-        "     \\_______/     ",
+        "          \\  /          ",
+        "       .-''''-.       ",
+        "     .'  o  o  `.     ",
+        "    /      ^      \\    ",
+        " .-'|   .-----.   |`-. ",
+        "/   |__/       \\__|   \\ ",
+        "\\__/   \\_____/   \\__/ ",
     )
     if not colored:
         return plain
@@ -164,10 +167,13 @@ def _welcome_art_lines(colored: bool) -> tuple[str, ...]:
     nose = "\033[95m"
     chin = "\033[92m"
     return (
-        f"{frame}      .-----.      {reset}",
-        f"{frame}     / {eyes}o{frame}   {eyes}o{frame} \\     {reset}",
-        f"{frame}     |   {nose}^{frame}   |     {reset}",
-        f"{frame}     {chin}\\_______/{frame}     {reset}",
+        f"{frame}          \\  /          {reset}",
+        f"{frame}       .-''''-.       {reset}",
+        f"{frame}     .'  {eyes}o{frame}  {eyes}o{frame}  `.     {reset}",
+        f"{frame}    /      {nose}^{frame}      \\    {reset}",
+        f"{frame} .-'|   {chin}.-----.{frame}   |`-. {reset}",
+        f"{frame}/   |__/       \\__|   \\{reset}",
+        f"{frame}\\__/   {chin}\\_____/{frame}   \\__/ {reset}",
     )
 
 
