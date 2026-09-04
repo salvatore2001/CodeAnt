@@ -27,6 +27,7 @@ from .proof import (
     PROOF_STATUS_UNVERIFIED,
     PROOF_STATUS_VERIFIED,
 )
+from .planning import PlanEvent, PlanMode, PlanPhase, PlanSpec, PlanningGraph, StructuredPlanner
 from .task_state import TaskState
 from . import tools as toolkit
 from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
@@ -114,6 +115,8 @@ class CodeAnt:
         proof_path=None,
         verify_commands=None,
         proof_repair_rounds=2,
+        plan_mode=None,
+        plan_max_tokens=700,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -133,6 +136,11 @@ class CodeAnt:
         self.proof_path = str(proof_path) if proof_path else ""
         self.verify_commands = tuple(str(item) for item in (verify_commands or ()) if str(item).strip())
         self.proof_repair_rounds = max(0, int(proof_repair_rounds))
+        self.plan_mode_override = None if plan_mode is None else str(plan_mode).lower()
+        if self.plan_mode_override not in {None, *(item.value for item in PlanMode)}:
+            raise ValueError("plan mode must be one of: off, auto, strict")
+        self.plan_mode = self.plan_mode_override or PlanMode.OFF.value
+        self.plan_max_tokens = max(200, int(plan_max_tokens))
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".codeant" / "runs")
@@ -167,6 +175,11 @@ class CodeAnt:
         self.proof_baseline = {}
         self.proof_records = []
         self.last_proof_result = None
+        self.plan = None
+        self.plan_graph = None
+        self.plan_state = None
+        self.plan_error = ""
+        self.plan_source = "none"
         self.tools = self.build_tools()
         self.prefix_state = self.build_prefix()
         self.prefix = self.prefix_state.text
@@ -228,6 +241,7 @@ class CodeAnt:
             "tool_signature": self.tool_signature(),
             "proof_mode": self.proof_mode,
             "proof_contract_digest": self.proof_contract.digest if hasattr(self, "proof_contract") else "",
+            "plan_mode": self.plan_mode,
         }
 
     def checkpoint_state(self):
@@ -281,6 +295,7 @@ class CodeAnt:
                     "tool_signature",
                     "proof_mode",
                     "proof_contract_digest",
+                    "plan_mode",
                 )
                 for key in identity_keys:
                     if key not in saved_identity:
@@ -321,6 +336,11 @@ class CodeAnt:
             f"- Current blocker: {checkpoint.get('current_blocker', '-') or '-'}",
             f"- Next step: {checkpoint.get('next_step', '-') or '-'}",
         ]
+        if checkpoint.get("plan_mode") and checkpoint.get("plan_mode") != PlanMode.OFF.value:
+            lines.append(
+                f"- Plan: {checkpoint.get('plan_phase', 'planning')}"
+                f"; current step: {checkpoint.get('current_step', '-') or '-'}"
+            )
         key_files = [str(item.get("path", "")).strip() for item in checkpoint.get("key_files", []) if str(item.get("path", "")).strip()]
         lines.append(f"- Key files: {', '.join(key_files) or '-'}")
         if checkpoint.get("completed"):
@@ -610,6 +630,15 @@ class CodeAnt:
                 "runtime_identity_mismatch_fields": list(self.resume_state.get("runtime_identity_mismatch_fields", [])),
             }
         )
+        metadata.update(
+            {
+                "plan_mode": self.plan_mode,
+                "plan_id": self.plan.plan_id if self.plan is not None else "",
+                "plan_phase": getattr(getattr(self.plan_state, "phase", ""), "value", getattr(self.plan_state, "phase", "")),
+                "current_step": self.plan_state.current_step if self.plan_state is not None else "",
+                "completed_steps": list(self.plan_state.completed_steps) if self.plan_state is not None else [],
+            }
+        )
         metadata.update(self.detected_secret_env_summary())
         return prompt, metadata
 
@@ -682,6 +711,11 @@ class CodeAnt:
             "proof_status": task_state.proof_status,
             "verification_rounds": task_state.verification_rounds,
             "proof_contract_digest": self.proof_contract.digest,
+            "plan_mode": task_state.plan_mode,
+            "plan_id": task_state.plan_id,
+            "plan_phase": task_state.plan_phase,
+            "current_step": task_state.current_step,
+            "completed_steps": list(task_state.completed_steps),
         }
         state["items"][checkpoint_id] = checkpoint
         state["current_id"] = checkpoint_id
@@ -690,6 +724,187 @@ class CodeAnt:
         self.session_path = self.session_store.save(self.session)
         return checkpoint
 
+    def render_plan_text(self):
+        """Render the validated plan and the current step for the model."""
+        if self.plan_mode == PlanMode.OFF.value:
+            return ""
+        if self.plan is None:
+            return "Structured task plan:\n- Planning is enabled; the plan is being prepared."
+        phase = getattr(getattr(self.plan_state, "phase", ""), "value", getattr(self.plan_state, "phase", ""))
+        completed = set(self.plan_state.completed_steps) if self.plan_state is not None else set()
+        lines = [
+            "Structured task plan:",
+            f"- Plan ID: {self.plan.plan_id}",
+            f"- Goal: {self.redact_text(self.plan.goal)}",
+            f"- Phase: {phase}",
+        ]
+        if self.plan_state is not None:
+            lines.append(f"- Current step: {self.plan_state.current_step or '(none)'}")
+            lines.append(f"- Completed steps: {', '.join(self.plan_state.completed_steps) or '(none)'}")
+            if self.plan_state.blocked_reason:
+                lines.append("- Blocker: " + self.redact_text(self.plan_state.blocked_reason))
+        if self.plan_error:
+            lines.append("- Planner warning: " + self.redact_text(self.plan_error))
+        for step in self.plan.steps:
+            if step.id in completed:
+                status = "completed"
+            elif self.plan_state is not None and step.id == self.plan_state.current_step:
+                status = "in_progress"
+            else:
+                status = "pending"
+            lines.append(f"- [{status}] {step.id}: {self.redact_text(step.objective)}")
+            if step.depends_on:
+                lines.append("  depends_on: " + ", ".join(step.depends_on))
+            if step.acceptance_criteria:
+                criteria = "; ".join(self.redact_text(item) for item in step.acceptance_criteria)
+                lines.append("  acceptance: " + criteria)
+        lines.append(
+            'When a step is complete, emit <plan_step_done id="step_id">brief evidence</plan_step_done> before continuing.'
+        )
+        return "\n".join(lines)
+
+    def _plan_artifact(self):
+        if self.plan is None:
+            return None
+        return self.redact_artifact(
+            {
+                "schema_version": 1,
+                "mode": self.plan_mode,
+                "source": self.plan_source,
+                "error": self.plan_error,
+                "plan": self.plan.model_dump(mode="json"),
+                "state": self.plan_state.to_dict() if self.plan_state is not None else None,
+                "proof_contract_digest": self.proof_contract.digest,
+            }
+        )
+
+    def _persist_plan_state(self):
+        if self.current_task_state is None:
+            return
+        if self.plan_state is None:
+            self.current_task_state.plan_mode = self.plan_mode
+        else:
+            phase = getattr(self.plan_state.phase, "value", self.plan_state.phase)
+            self.current_task_state.plan_mode = self.plan_mode
+            self.current_task_state.record_plan(
+                self.plan_state.plan.plan_id,
+                phase,
+                current_step=self.plan_state.current_step,
+                completed_steps=self.plan_state.completed_steps,
+                blocker=self.plan_state.blocked_reason,
+            )
+        self.run_store.write_task_state(self.current_task_state)
+        artifact = self._plan_artifact()
+        if self.plan_mode != PlanMode.OFF.value and artifact is not None:
+            self.run_store.write_plan(self.current_task_state, artifact)
+
+    def _advance_plan(self, event=None):
+        if self.plan_graph is None:
+            return None
+        self.plan_state = self.plan_graph.advance(event)
+        self._persist_plan_state()
+        return self.plan_state
+
+    def begin_plan(self, user_message):
+        """Generate a typed plan, then initialize its deterministic LangGraph."""
+        self.plan_mode = self.plan_mode_override or PlanMode.OFF.value
+        self.plan = None
+        self.plan_graph = None
+        self.plan_state = None
+        self.plan_error = ""
+        self.plan_source = "none"
+        if self.current_task_state is not None:
+            self.current_task_state.plan_mode = self.plan_mode
+            self.current_task_state.record_plan(
+                "",
+                PlanPhase.NOT_REQUIRED.value if self.plan_mode == PlanMode.OFF.value else PlanPhase.PLANNING.value,
+            )
+            self.run_store.write_task_state(self.current_task_state)
+        if self.plan_mode == PlanMode.OFF.value:
+            return None
+
+        self.emit_trace(
+            self.current_task_state,
+            "plan_started",
+            {"mode": self.plan_mode, "max_tokens": self.plan_max_tokens},
+        )
+        plan_id = "plan_" + uuid.uuid4().hex[:10]
+        planner = StructuredPlanner(
+            self.model_client,
+            max_new_tokens=self.plan_max_tokens,
+            redact_fn=self.redact_text,
+        )
+        try:
+            self.plan = planner.generate(
+                user_message,
+                clip(self.workspace.text(), 6000),
+                plan_id,
+            )
+            self.plan_source = "model"
+        except Exception as exc:
+            self.plan_error = f"{type(exc).__name__}: {exc}"
+            self.plan_source = "fallback"
+            self.plan = PlanSpec.fallback(user_message, plan_id)
+        self.plan_graph = PlanningGraph(self.plan)
+        self._advance_plan()
+        self.emit_trace(
+            self.current_task_state,
+            "plan_created",
+            {
+                "plan_id": self.plan.plan_id,
+                "source": self.plan_source,
+                "error": self.plan_error,
+                "step_count": len(self.plan.steps),
+                "phase": getattr(self.plan_state.phase, "value", self.plan_state.phase),
+            },
+        )
+        return self.plan_state
+
+    def complete_plan(self):
+        if self.plan_state is None or self.plan_state.phase == PlanPhase.BLOCKED:
+            return
+        self.plan_state = self.plan_state.model_copy(
+            update={"phase": PlanPhase.COMPLETED, "current_step": ""}
+        )
+        self._persist_plan_state()
+
+    def plan_final_answer(self, final):
+        if self.plan_mode == PlanMode.OFF.value:
+            return final
+        phase = getattr(getattr(self.plan_state, "phase", ""), "value", getattr(self.plan_state, "phase", ""))
+        lines = [str(final).strip(), "", f"Plan: {phase.upper()}"]
+        if self.plan is not None:
+            lines.append(f"Plan ID: {self.plan.plan_id}")
+        if self.plan_state is not None and self.plan_state.blocked_reason:
+            lines.append("Plan issues: " + self.redact_text(self.plan_state.blocked_reason))
+        if self.plan_error:
+            lines.append("Plan issues: " + self.redact_text(self.plan_error))
+        return "\n".join(lines)
+
+    def finalize_plan_failure(self, task_state, user_message, final, run_started_at):
+        authoritative_final = self.plan_final_answer(final)
+        task_state.stop_plan_failed(authoritative_final)
+        self.promote_durable_memory(user_message, final)
+        self.run_store.write_task_state(task_state)
+        checkpoint = self.create_checkpoint(task_state, user_message, trigger="plan_failed")
+        self.emit_trace(
+            task_state,
+            "checkpoint_created",
+            {"checkpoint_id": checkpoint["checkpoint_id"], "trigger": "plan_failed"},
+        )
+        self.emit_trace(
+            task_state,
+            "run_finished",
+            {
+                "status": task_state.status,
+                "stop_reason": task_state.stop_reason,
+                "final_answer": authoritative_final,
+                "plan_phase": task_state.plan_phase,
+                "run_duration_ms": int((time.monotonic() - run_started_at) * 1000),
+            },
+        )
+        self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
+        return authoritative_final
     def render_proof_text(self):
         """Render the immutable contract and latest result for the model."""
         if not self.proof_contract.configured:
@@ -821,6 +1036,10 @@ class CodeAnt:
             lines.append("Proof issues: " + "; ".join(result.failure_reasons))
         return "\n".join(lines)
     def infer_next_step(self, task_state):
+        if task_state.plan_blocker:
+            return "Resolve the structured plan blocker: " + self.redact_text(task_state.plan_blocker)
+        if task_state.current_step:
+            return f"Continue structured plan step {task_state.current_step}."
         if task_state.proof_status in {PROOF_STATUS_FAILED, PROOF_STATUS_UNVERIFIED}:
             return "Inspect AntProof evidence and repair or verify the task."
         if task_state.status == "completed":
@@ -974,6 +1193,7 @@ class CodeAnt:
         self.current_task_state = task_state
         self.current_run_dir = self.run_store.start_run(task_state)
         self.begin_proof()
+        self.begin_plan(user_message)
         self.emit_trace(
             task_state,
             "run_started",
@@ -983,6 +1203,10 @@ class CodeAnt:
                 "proof_mode": self.proof_contract.mode,
                 "proof_contract_digest": self.proof_contract.digest,
                 "proof_contract_source": self.proof_contract.source,
+                "plan_mode": self.plan_mode,
+                "plan_id": self.plan.plan_id if self.plan is not None else "",
+                "plan_source": self.plan_source,
+                "plan_error": self.plan_error,
             },
         )
 
@@ -1090,6 +1314,35 @@ class CodeAnt:
                 },
             )
 
+            if kind == "plan_step_done":
+                if self.plan_graph is None:
+                    self.record(
+                        {
+                            "role": "tool",
+                            "name": "planner",
+                            "content": "Structured planning is disabled; continue with a tool call or final answer.",
+                            "created_at": now(),
+                        }
+                    )
+                    continue
+                plan_state = self._advance_plan(
+                    PlanEvent(
+                        kind="step_done",
+                        step_id=str(payload.get("step_id", "")),
+                        summary=str(payload.get("summary", "")),
+                    )
+                )
+                self.emit_trace(
+                    task_state,
+                    "plan_step_completed",
+                    {
+                        "step_id": payload.get("step_id", ""),
+                        "summary": clip(payload.get("summary", ""), 300),
+                        "phase": getattr(plan_state.phase, "value", plan_state.phase),
+                        "current_step": plan_state.current_step,
+                    },
+                )
+                continue
             if kind == "tool":
                 tool_steps += 1
                 name = payload.get("name", "")
@@ -1175,7 +1428,12 @@ class CodeAnt:
                 )
                 continue
 
-            authoritative_final = self.proof_final_answer(final, proof_result)
+            if self.plan_mode == PlanMode.STRICT.value and self.plan_error:
+                self.plan_state = self.plan_state.model_copy(update={"phase": PlanPhase.FAILED, "current_step": ""})
+                self._persist_plan_state()
+                return self.finalize_plan_failure(task_state, user_message, final, run_started_at)
+            self.complete_plan()
+            authoritative_final = self.plan_final_answer(self.proof_final_answer(final, proof_result))
             if not proof_result.passed:
                 if proof_result.status == PROOF_STATUS_UNVERIFIED:
                     task_state.stop_proof_unverified(authoritative_final)
@@ -1411,8 +1669,31 @@ class CodeAnt:
             "durable_superseded": list(self.last_durable_superseded),
             "redacted_env": self.detected_secret_env_summary(),
             "proof": self.last_proof_result.to_dict() if self.last_proof_result is not None else None,
+            "plan_mode": task_state.plan_mode,
+            "plan_id": task_state.plan_id,
+            "plan_phase": task_state.plan_phase,
+            "current_step": task_state.current_step,
+            "completed_steps": list(task_state.completed_steps or []),
+            "plan_artifact": str(self.run_store.plan_path(task_state)) if self.plan_mode != PlanMode.OFF.value else "",
+            "plan": self._plan_artifact(),
         }
 
+    def plan_summary(self):
+        if self.plan is None:
+            return f"Plan mode: {self.plan_mode}\nPlan: not initialized"
+        phase = getattr(getattr(self.plan_state, "phase", ""), "value", getattr(self.plan_state, "phase", ""))
+        lines = [
+            f"Plan: {phase.upper()}",
+            f"Plan ID: {self.plan.plan_id}",
+            f"Mode: {self.plan_mode}",
+            f"Steps: {len(self.plan.steps)}",
+            f"Completed: {len(self.plan_state.completed_steps) if self.plan_state is not None else 0}",
+        ]
+        if self.current_task_state is not None and self.plan_mode != PlanMode.OFF.value:
+            lines.append(f"Evidence: {self.run_store.plan_path(self.current_task_state)}")
+        if self.plan_error:
+            lines.append("Warning: " + self.redact_text(self.plan_error))
+        return "\n".join(lines)
     def proof_summary(self):
         if self.last_proof_result is None:
             return (
@@ -1486,13 +1767,22 @@ class CodeAnt:
 
         输入 / 输出：
         - 输入：模型返回的原始文本 `raw`
-        - 输出：`(kind, payload)`，其中 `kind` 可能是 `tool`、`final`、`retry`
+        - 输出：`(kind, payload)`，其中 `kind` 可能是 `tool`、`plan_step_done`、`final`、`retry`
 
         在 agent 链路里的位置：
         它位于 `model_client.complete()` 之后、`run_tool()` 之前，是模型输出
         进入平台控制流的第一道结构化关口。
         """
         raw = str(raw)
+        if "<plan_step_done" in raw and ("<final>" not in raw or raw.find("<plan_step_done") < raw.find("<final>")):
+            match = re.search(r"<plan_step_done(?P<attrs>[^>]*)>(?P<body>.*?)</plan_step_done>", raw, re.S)
+            if not match:
+                return "retry", CodeAnt.retry_notice("model returned malformed plan_step_done output")
+            attrs = CodeAnt.parse_attrs(match.group("attrs"))
+            step_id = str(attrs.get("id", "")).strip()
+            if not step_id:
+                return "retry", CodeAnt.retry_notice("plan_step_done is missing a step id")
+            return "plan_step_done", {"step_id": step_id, "summary": match.group("body").strip()}
         # 这里支持两种工具格式：
         # 1. <tool>...</tool> 里包 JSON，适合简短调用
         # 2. XML 风格属性/子标签，适合写文件这类多行内容
@@ -1535,7 +1825,7 @@ class CodeAnt:
         else:
             prefix += ": model returned malformed tool output"
         return (
-            f"{prefix}. Reply with a valid <tool> call or a non-empty <final> answer. "
+            f"{prefix}. Reply with a valid <tool> call, <plan_step_done> event, or a non-empty <final> answer. "
             'For multi-line files, prefer <tool name="write_file" path="file.py"><content>...</content></tool>.'
         )
 
@@ -1608,6 +1898,12 @@ class CodeAnt:
         self.proof_contract = ProofContract.empty(mode="off")
         self.proof_mode = "off"
         self.proof_engine = None
+        self.plan = None
+        self.plan_graph = None
+        self.plan_state = None
+        self.plan_error = ""
+        self.plan_source = "none"
+        self.plan_mode = PlanMode.OFF.value
         self.session_store.save(self.session)
 
     def path(self, raw_path):

@@ -35,6 +35,9 @@ class RunStore:
     def proof_path(self, run_id):
         return self.run_dir(run_id) / "proof.json"
 
+    def plan_path(self, run_id):
+        return self.run_dir(run_id) / "plan.json"
+
     def start_run(self, task_state):
         # 每次 ask() 都会生成一个 run 目录。
         # 这样一次用户请求对应一组独立工件，后续排查更容易。
@@ -71,6 +74,12 @@ class RunStore:
         self._write_json_atomic(path, proof)
         return path
 
+    def write_plan(self, task_state, plan):
+        path = self.plan_path(task_state)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_json_atomic(path, plan)
+        return path
+
     def load_task_state(self, task_id):
         return json.loads(self.task_state_path(task_id).read_text(encoding="utf-8"))
 
@@ -79,6 +88,9 @@ class RunStore:
 
     def load_proof(self, task_id):
         return json.loads(self.proof_path(task_id).read_text(encoding="utf-8"))
+
+    def load_plan(self, task_id):
+        return json.loads(self.plan_path(task_id).read_text(encoding="utf-8"))
 
     def _write_json_atomic(self, path, payload):
         # 原子写：先写临时文件，再 replace。

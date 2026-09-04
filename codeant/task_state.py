@@ -24,6 +24,8 @@ STOP_REASON_PERSISTENCE_ERROR = "persistence_error"
 STOP_REASON_RESUME_LOAD_ERROR = "resume_load_error"
 STOP_REASON_PROOF_FAILED = "proof_failed"
 STOP_REASON_PROOF_UNVERIFIED = "proof_unverified"
+STOP_REASON_PLAN_FAILED = "plan_failed"
+STOP_REASON_PLAN_BLOCKED = "plan_blocked"
 
 
 @dataclass
@@ -42,6 +44,12 @@ class TaskState:
     proof_status: str = "not_required"
     verification_rounds: int = 0
     failed_checks: list[str] = field(default_factory=list)
+    plan_mode: str = "off"
+    plan_id: str = ""
+    plan_phase: str = "not_required"
+    current_step: str = ""
+    completed_steps: list[str] = field(default_factory=list)
+    plan_blocker: str = ""
 
     @classmethod
     def create(cls, task_id, user_request, run_id=""):
@@ -66,6 +74,12 @@ class TaskState:
             proof_status=str(data.get("proof_status", "not_required")),
             verification_rounds=int(data.get("verification_rounds", 0)),
             failed_checks=list(data.get("failed_checks", []) or []),
+            plan_mode=str(data.get("plan_mode", "off")),
+            plan_id=str(data.get("plan_id", "")),
+            plan_phase=str(data.get("plan_phase", "not_required")),
+            current_step=str(data.get("current_step", "")),
+            completed_steps=list(data.get("completed_steps", []) or []),
+            plan_blocker=str(data.get("plan_blocker", "")),
         )
 
 
@@ -115,6 +129,20 @@ class TaskState:
     def stop_proof_unverified(self, final_answer=""):
         return self.stop(STOP_REASON_PROOF_UNVERIFIED, status=STATUS_STOPPED, final_answer=final_answer)
 
+    def record_plan(self, plan_id, phase, current_step="", completed_steps=None, blocker=""):
+        self.plan_id = str(plan_id or "")
+        self.plan_phase = str(phase or "not_required")
+        self.current_step = str(current_step or "")
+        self.completed_steps = [str(item) for item in (completed_steps or [])]
+        self.plan_blocker = str(blocker or "")
+        return self
+
+    def stop_plan_failed(self, final_answer=""):
+        return self.stop(STOP_REASON_PLAN_FAILED, status=STATUS_FAILED, final_answer=final_answer)
+
+    def stop_plan_blocked(self, final_answer=""):
+        return self.stop(STOP_REASON_PLAN_BLOCKED, status=STATUS_STOPPED, final_answer=final_answer)
+
     def to_dict(self):
         return {
             "run_id": self.run_id,
@@ -131,4 +159,10 @@ class TaskState:
             "proof_status": self.proof_status,
             "verification_rounds": self.verification_rounds,
             "failed_checks": list(self.failed_checks or []),
+            "plan_mode": self.plan_mode,
+            "plan_id": self.plan_id,
+            "plan_phase": self.plan_phase,
+            "current_step": self.current_step,
+            "completed_steps": list(self.completed_steps or []),
+            "plan_blocker": self.plan_blocker,
         }

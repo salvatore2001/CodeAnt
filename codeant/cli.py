@@ -36,6 +36,7 @@ HELP_DETAILS = textwrap.dedent(
     /memory  Show the agent's distilled working memory.
     /session Show the path to the saved session file.
     /proof   Show the latest AntProof status and evidence path.
+    /plan    Show the current structured task plan and active step.
     /reset   Clear the current session history and memory.
     /exit    Exit the agent.
     """
@@ -225,6 +226,7 @@ def build_welcome(agent, model, host):
             pair("MODEL", model, "BRANCH", agent.workspace.branch),
             pair("APPROVAL", agent.approval_policy, "SESSION", agent.session["id"]),
             pair("PROOF", agent.proof_mode, "CHECKS", str(len(agent.proof_contract.checks))),
+            pair("PLAN", getattr(agent, "plan_mode", "off"), "STEP", getattr(getattr(agent, "plan_state", None), "current_step", "-")),
             row(""),
         ]
     )
@@ -271,6 +273,8 @@ def build_agent(args):
             proof_path=getattr(args, "proof_config", None),
             verify_commands=getattr(args, "verify_commands", []),
             proof_repair_rounds=getattr(args, "proof_repair_rounds", 2),
+            plan_mode=getattr(args, "plan", None),
+            plan_max_tokens=getattr(args, "plan_max_tokens", 700),
         )
     return CodeAnt(
         model_client=model,
@@ -284,6 +288,8 @@ def build_agent(args):
         proof_path=getattr(args, "proof_config", None),
         verify_commands=getattr(args, "verify_commands", []),
         proof_repair_rounds=getattr(args, "proof_repair_rounds", 2),
+        plan_mode=getattr(args, "plan", None),
+        plan_max_tokens=getattr(args, "plan_max_tokens", 700),
     )
 
 
@@ -316,6 +322,8 @@ def build_arg_parser():
         help="Required verification command; may be repeated and overrides configured checks.",
     )
     parser.add_argument("--proof-repair-rounds", type=int, default=2, help="Maximum repair rounds after failed AntProof checks.")
+    parser.add_argument("--plan", choices=("off", "auto", "strict"), default=None, help="Structured planning mode; off preserves the legacy loop.")
+    parser.add_argument("--plan-max-tokens", type=int, default=700, help="Maximum model output tokens used to generate a plan.")
     parser.add_argument(
         "--secret-env-name",
         dest="secret_env_names",
@@ -378,6 +386,9 @@ def main(argv=None):
             continue
         if user_input == "/proof":
             print(agent.proof_summary())
+            continue
+        if user_input == "/plan":
+            print(agent.plan_summary())
             continue
         if user_input == "/reset":
             agent.reset()

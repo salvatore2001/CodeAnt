@@ -122,6 +122,11 @@ class ContextManager:
             proof_text = str(self.agent.render_proof_text() or "").strip()
         if proof_text:
             dynamic_prefix.append(proof_text)
+        plan_text = ""
+        if hasattr(self.agent, "render_plan_text"):
+            plan_text = str(self.agent.render_plan_text() or "").strip()
+        if plan_text:
+            dynamic_prefix.append(plan_text)
         if dynamic_prefix:
             section_texts["prefix"] = "\n\n".join([*dynamic_prefix, section_texts["prefix"]])
         selected_notes = []
