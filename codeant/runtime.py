@@ -18,6 +18,15 @@ from pathlib import Path
 from . import memory as memorylib
 from .context_manager import ContextManager
 from .run_store import RunStore
+from .proof import (
+    AntProofEngine,
+    ProofContract,
+    PROOF_STATUS_FAILED,
+    PROOF_STATUS_NOT_REQUIRED,
+    PROOF_STATUS_PENDING,
+    PROOF_STATUS_UNVERIFIED,
+    PROOF_STATUS_VERIFIED,
+)
 from .task_state import TaskState
 from . import tools as toolkit
 from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
@@ -101,6 +110,10 @@ class CodeAnt:
         shell_env_allowlist=None,
         secret_env_names=None,
         feature_flags=None,
+        proof_mode=None,
+        proof_path=None,
+        verify_commands=None,
+        proof_repair_rounds=2,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -115,6 +128,11 @@ class CodeAnt:
         self.shell_env_allowlist = tuple(shell_env_allowlist or DEFAULT_SHELL_ENV_ALLOWLIST)
         self.secret_env_names = {str(name).upper() for name in (secret_env_names or ())}
         self.feature_flags = dict(DEFAULT_FEATURE_FLAGS)
+        self.proof_mode_override = None if proof_mode is None else str(proof_mode).lower()
+        self.proof_mode = self.proof_mode_override or "auto"
+        self.proof_path = str(proof_path) if proof_path else ""
+        self.verify_commands = tuple(str(item) for item in (verify_commands or ()) if str(item).strip())
+        self.proof_repair_rounds = max(0, int(proof_repair_rounds))
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".codeant" / "runs")
@@ -131,6 +149,24 @@ class CodeAnt:
             workspace_root=self.root,
         )
         self.session["memory"] = self.memory.to_dict()
+        self.proof_contract = ProofContract.load(
+            self.root,
+            mode=self.proof_mode_override,
+            proof_path=self.proof_path or None,
+            verify_commands=self.verify_commands,
+        )
+        self.proof_mode = self.proof_contract.mode
+        self.proof_engine = AntProofEngine(
+            contract=self.proof_contract,
+            root=self.root,
+            snapshot_fn=self.capture_workspace_snapshot,
+            redact_fn=self.redact_text,
+            approve_fn=self.approve,
+            shell_env_fn=self.shell_env,
+        )
+        self.proof_baseline = {}
+        self.proof_records = []
+        self.last_proof_result = None
         self.tools = self.build_tools()
         self.prefix_state = self.build_prefix()
         self.prefix = self.prefix_state.text
@@ -190,6 +226,8 @@ class CodeAnt:
             "shell_env_allowlist": list(self.shell_env_allowlist),
             "workspace_fingerprint": getattr(getattr(self, "prefix_state", None), "workspace_fingerprint", self.workspace.fingerprint()),
             "tool_signature": self.tool_signature(),
+            "proof_mode": self.proof_mode,
+            "proof_contract_digest": self.proof_contract.digest if hasattr(self, "proof_contract") else "",
         }
 
     def checkpoint_state(self):
@@ -241,6 +279,8 @@ class CodeAnt:
                     "shell_env_allowlist",
                     "workspace_fingerprint",
                     "tool_signature",
+                    "proof_mode",
+                    "proof_contract_digest",
                 )
                 for key in identity_keys:
                     if key not in saved_identity:
@@ -360,6 +400,8 @@ class CodeAnt:
             - New files should be complete and runnable, including obvious imports.
             - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.
             - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={{}}.
+            - AntProof may verify a final answer against an immutable repository contract.
+            - Treat AntProof failures as tool evidence: fix the reported issue before returning another final answer.
 
             Tools:
             {tool_text}
@@ -509,6 +551,13 @@ class CodeAnt:
             return redacted
         return value
 
+    def shell_executable(self):
+        if os.name != "nt":
+            return None
+        configured = os.environ.get("ComSpec") or os.environ.get("COMSPEC")
+        system_root = os.environ.get("SystemRoot") or os.environ.get("SYSTEMROOT") or r"C:\Windows"
+        return configured or system_root + r"\System32\cmd.exe"
+
     def shell_env(self):
         env = {
             name: os.environ[name]
@@ -516,6 +565,14 @@ class CodeAnt:
             if name in os.environ
         }
         env["PWD"] = str(self.root)
+        if os.name == "nt":
+            # cmd.exe needs these non-secret variables even when the parent env was cleared.
+            env.setdefault("SystemRoot", os.environ.get("SystemRoot") or os.environ.get("SYSTEMROOT") or r"C:\Windows")
+            env.setdefault("SYSTEMROOT", env["SystemRoot"])
+            env.setdefault("COMSPEC", os.environ.get("COMSPEC") or os.environ.get("ComSpec") or env["SystemRoot"] + r"\System32\cmd.exe")
+            env.setdefault("WINDIR", os.environ.get("WINDIR") or env["SystemRoot"])
+            env.setdefault("ComSpec", os.environ.get("ComSpec") or os.environ.get("COMSPEC") or env["SystemRoot"] + r"\System32\cmd.exe")
+            env.setdefault("PATHEXT", os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD")
         if "PATH" not in env and os.environ.get("PATH"):
             env["PATH"] = os.environ["PATH"]
         return env
@@ -622,6 +679,9 @@ class CodeAnt:
             "freshness": freshness,
             "summary": f"{trigger}: {clip(str(user_message), 120)}",
             "runtime_identity": self.current_runtime_identity(),
+            "proof_status": task_state.proof_status,
+            "verification_rounds": task_state.verification_rounds,
+            "proof_contract_digest": self.proof_contract.digest,
         }
         state["items"][checkpoint_id] = checkpoint
         state["current_id"] = checkpoint_id
@@ -630,7 +690,139 @@ class CodeAnt:
         self.session_path = self.session_store.save(self.session)
         return checkpoint
 
+    def render_proof_text(self):
+        """Render the immutable contract and latest result for the model."""
+        if not self.proof_contract.configured:
+            if self.proof_contract.mode == "strict":
+                return "\n".join(
+                    [
+                        "AntProof contract:",
+                        "- Strict mode is enabled, but no proof contract is configured.",
+                        "- The final result will be UNVERIFIED until .codeant/proof.json or --verify-command is provided.",
+                    ]
+                )
+            return ""
+        lines = [
+            "AntProof contract:",
+            f"- Mode: {self.proof_contract.mode}",
+            f"- Digest: {self.proof_contract.digest}",
+            f"- Expected workspace changes: {self.proof_contract.expects_changes}",
+        ]
+        if self.proof_contract.allowed_change_paths:
+            lines.append("- Allowed change paths: " + ", ".join(self.proof_contract.allowed_change_paths))
+        for check in self.proof_contract.checks:
+            requirement = "required" if check.required else "optional"
+            lines.append(f"- Check {check.check_id} ({requirement}): {self.redact_text(check.command)}")
+        lines.append("Submitting <final> triggers these checks. Do not claim they passed before AntProof runs them.")
+        if self.last_proof_result is not None and self.last_proof_result.status not in {
+            PROOF_STATUS_VERIFIED,
+            PROOF_STATUS_NOT_REQUIRED,
+        }:
+            lines.append(self.redact_text(self.last_proof_result.feedback()))
+        return "\n".join(lines)
+
+    def begin_proof(self):
+        """Load an immutable contract and capture the current run baseline."""
+        self.proof_contract = ProofContract.load(
+            self.root,
+            mode=self.proof_mode_override,
+            proof_path=self.proof_path or None,
+            verify_commands=self.verify_commands,
+        )
+        self.proof_mode = self.proof_contract.mode
+        self.proof_engine = AntProofEngine(
+            contract=self.proof_contract,
+            root=self.root,
+            snapshot_fn=self.capture_workspace_snapshot,
+            redact_fn=self.redact_text,
+            approve_fn=self.approve,
+            shell_env_fn=self.shell_env,
+        )
+        self.proof_baseline = self.capture_workspace_snapshot()
+        self.proof_records = []
+        self.last_proof_result = None
+        if self.current_task_state is not None:
+            if self.proof_contract.configured or self.proof_contract.mode == "strict":
+                self.current_task_state.proof_status = PROOF_STATUS_PENDING
+            else:
+                self.current_task_state.proof_status = PROOF_STATUS_NOT_REQUIRED
+            self.run_store.write_task_state(self.current_task_state)
+            if self.proof_contract.mode != "off":
+                self.run_store.write_proof(
+                    self.current_task_state,
+                    self.redact_artifact(
+                        {
+                            "schema_version": 1,
+                            "run_id": self.current_task_state.run_id,
+                            "contract": self.proof_contract.to_dict(),
+                            "contract_digest": self.proof_contract.digest,
+                            "attempts": [],
+                            "latest": None,
+                        }
+                    ),
+                )
+        return self.proof_baseline
+
+    def verify_final(self, final):
+        """Verify a model final and persist an auditable proof attempt."""
+        result = self.proof_engine.run(self.proof_baseline, now=now())
+        self.last_proof_result = result
+        self.proof_records.append(result.to_dict())
+        if self.current_task_state is not None:
+            failed = list(result.failure_reasons)
+            failed.extend(
+                str(check.get("id"))
+                for check in result.checks
+                if check.get("required") and check.get("status") != "passed"
+            )
+            if result.status == PROOF_STATUS_NOT_REQUIRED:
+                self.current_task_state.proof_status = result.status
+                self.current_task_state.failed_checks = []
+            else:
+                self.current_task_state.record_proof(result.status, failed_checks=failed)
+            if self.proof_contract.mode != "off":
+                proof_artifact = {
+                    "schema_version": 1,
+                    "run_id": self.current_task_state.run_id,
+                    "contract": self.proof_contract.to_dict(),
+                    "contract_digest": self.proof_contract.digest,
+                    "attempts": list(self.proof_records),
+                    "latest": result.to_dict(),
+                }
+                self.run_store.write_proof(
+                    self.current_task_state,
+                    self.redact_artifact(proof_artifact),
+                )
+                self.emit_trace(
+                    self.current_task_state,
+                    "proof_completed",
+                    {
+                        "status": result.status,
+                        "contract_digest": self.proof_contract.digest,
+                        "changed_paths": list(result.changed_paths),
+                        "failed_checks": list(failed),
+                        "duration_ms": result.duration_ms,
+                    },
+                )
+            self.run_store.write_task_state(self.current_task_state)
+        return result
+
+    @staticmethod
+    def proof_final_answer(final, result):
+        if result.status == PROOF_STATUS_NOT_REQUIRED:
+            return final
+        lines = [str(final).strip(), "", f"AntProof: {result.status.upper()}"]
+        if result.changed_paths:
+            lines.append("Changed paths: " + ", ".join(result.changed_paths))
+        for check in result.checks:
+            marker = "passed" if check.get("status") == "passed" else check.get("status", "failed")
+            lines.append(f"- {check.get('id')}: {marker}")
+        if result.failure_reasons:
+            lines.append("Proof issues: " + "; ".join(result.failure_reasons))
+        return "\n".join(lines)
     def infer_next_step(self, task_state):
+        if task_state.proof_status in {PROOF_STATUS_FAILED, PROOF_STATUS_UNVERIFIED}:
+            return "Inspect AntProof evidence and repair or verify the task."
         if task_state.status == "completed":
             return "No next step recorded."
         if task_state.stop_reason == "step_limit_reached":
@@ -781,12 +973,16 @@ class CodeAnt:
         task_state.resume_status = self.resume_state.get("status", CHECKPOINT_NONE_STATUS)
         self.current_task_state = task_state
         self.current_run_dir = self.run_store.start_run(task_state)
+        self.begin_proof()
         self.emit_trace(
             task_state,
             "run_started",
             {
                 "task_id": task_state.task_id,
                 "user_request": clip(user_message, 300),
+                "proof_mode": self.proof_contract.mode,
+                "proof_contract_digest": self.proof_contract.digest,
+                "proof_contract_source": self.proof_contract.source,
             },
         )
 
@@ -941,7 +1137,52 @@ class CodeAnt:
 
             final = (payload or raw).strip()
             self.record({"role": "assistant", "content": final, "created_at": now()})
-            task_state.finish_success(final)
+            if self.proof_contract.mode != "off":
+                self.emit_trace(
+                    task_state,
+                    "proof_started",
+                    {
+                        "round": task_state.verification_rounds + 1,
+                        "contract_digest": self.proof_contract.digest,
+                    },
+                )
+            proof_result = self.verify_final(final)
+            can_repair = (
+                proof_result.status == PROOF_STATUS_FAILED
+                and task_state.verification_rounds <= self.proof_repair_rounds
+                and tool_steps < self.max_steps
+                and attempts < max_attempts
+            )
+            if can_repair:
+                feedback = self.redact_text(proof_result.feedback())
+                feedback += f"\nRemaining repair rounds: {self.proof_repair_rounds - task_state.verification_rounds + 1}."
+                self.record(
+                    {
+                        "role": "tool",
+                        "name": "antproof",
+                        "args": {"contract_digest": self.proof_contract.digest},
+                        "content": feedback,
+                        "created_at": now(),
+                    }
+                )
+                self.emit_trace(
+                    task_state,
+                    "proof_repair_requested",
+                    {
+                        "round": task_state.verification_rounds,
+                        "remaining_rounds": self.proof_repair_rounds - task_state.verification_rounds + 1,
+                    },
+                )
+                continue
+
+            authoritative_final = self.proof_final_answer(final, proof_result)
+            if not proof_result.passed:
+                if proof_result.status == PROOF_STATUS_UNVERIFIED:
+                    task_state.stop_proof_unverified(authoritative_final)
+                else:
+                    task_state.stop_proof_failed(authoritative_final)
+            else:
+                task_state.finish_success(authoritative_final)
             self.promote_durable_memory(user_message, final)
             checkpoint = self.create_checkpoint(task_state, user_message, trigger="run_finished")
             self.run_store.write_task_state(task_state)
@@ -959,12 +1200,13 @@ class CodeAnt:
                 {
                     "status": task_state.status,
                     "stop_reason": task_state.stop_reason,
-                    "final_answer": final,
+                    "final_answer": authoritative_final,
+                    "proof_status": task_state.proof_status,
                     "run_duration_ms": int((time.monotonic() - run_started_at) * 1000),
                 },
             )
             self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
-            return final
+            return authoritative_final
 
         if attempts >= max_attempts and tool_steps < self.max_steps:
             final = "Stopped after too many malformed model responses without a valid tool call or final answer."
@@ -1156,14 +1398,39 @@ class CodeAnt:
             "attempts": task_state.attempts,
             "checkpoint_id": task_state.checkpoint_id,
             "resume_status": task_state.resume_status,
+            "proof_status": task_state.proof_status,
+            "proof_contract_digest": self.proof_contract.digest,
+            "proof_contract_source": self.proof_contract.source,
+            "verification_rounds": task_state.verification_rounds,
+            "failed_checks": list(task_state.failed_checks or []),
+            "proof_artifact": str(self.run_store.proof_path(task_state)) if self.proof_contract.mode != "off" else "",
             "task_state": task_state.to_dict(),
             "prompt_metadata": self.last_prompt_metadata,
             "durable_promotions": list(self.last_durable_promotions),
             "durable_rejections": list(self.last_durable_rejections),
             "durable_superseded": list(self.last_durable_superseded),
             "redacted_env": self.detected_secret_env_summary(),
+            "proof": self.last_proof_result.to_dict() if self.last_proof_result is not None else None,
         }
 
+    def proof_summary(self):
+        if self.last_proof_result is None:
+            return (
+                f"AntProof mode: {self.proof_contract.mode}\n"
+                f"Contract: {self.proof_contract.source}\n"
+                f"Checks: {len(self.proof_contract.checks)}"
+            )
+        result = self.last_proof_result
+        lines = [
+            f"AntProof: {result.status.upper()}",
+            f"Contract: {self.proof_contract.source}",
+            f"Digest: {self.proof_contract.digest}",
+        ]
+        if self.current_task_state is not None:
+            lines.append(f"Evidence: {self.run_store.proof_path(self.current_task_state)}")
+        if result.changed_paths:
+            lines.append("Changed paths: " + ", ".join(result.changed_paths))
+        return "\n".join(lines)
     def tool_example(self, name):
         return toolkit.tool_example(name)
 
@@ -1333,6 +1600,14 @@ class CodeAnt:
         self.session["memory"].clear()
         self.session["memory"].update(memorylib.default_memory_state())
         self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root=self.root)
+        self.current_task_state = None
+        self.current_run_dir = None
+        self.proof_baseline = {}
+        self.proof_records = []
+        self.last_proof_result = None
+        self.proof_contract = ProofContract.empty(mode="off")
+        self.proof_mode = "off"
+        self.proof_engine = None
         self.session_store.save(self.session)
 
     def path(self, raw_path):

@@ -140,3 +140,31 @@ uv run codeant --provider anthropic
 ```bash
 uv run ruff check .
 ```
+
+## AntProof：可验证交付
+
+AntProof 在模型提交最终答案前执行可审计的验证契约，用来确认代码检查、测试命令和工作区变更是否符合预期。契约可以放在仓库的 `.codeant/proof.json`，也可以通过 CLI 传入验证命令。
+
+```json
+{
+  "schema_version": 1,
+  "mode": "strict",
+  "expects_changes": true,
+  "allowed_change_paths": ["codeant/**", "tests/**"],
+  "checks": [
+    {"id": "tests", "command": "python -m pytest -q", "required": true, "timeout": 60}
+  ]
+}
+```
+
+常用参数：
+
+```bash
+uv run codeant --proof auto
+uv run codeant --proof strict --proof-repair-rounds 2
+uv run codeant --verify-command "python -m pytest -q"
+```
+
+`auto` 在没有契约时保持兼容并跳过验证；`strict` 没有契约或必需检查未通过时不会把任务标记为成功；`off` 完全关闭 AntProof。每次运行的验证结果会写入 `.codeant/runs/<run_id>/proof.json`，并可在 REPL 中用 `/proof` 查看。
+
+安全提示：proof 配置中的验证命令会以当前用户权限在工作区执行，和运行测试脚本一样属于可执行代码。只对信任的仓库启用自动审批，并检查 `.codeant/proof.json` 内容；审批策略仍由 `--approval` 控制。

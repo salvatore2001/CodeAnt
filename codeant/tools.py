@@ -4,6 +4,7 @@
 如何做参数校验，以及最终如何执行，都是在这里定义的。
 """
 
+import os
 import shutil
 import subprocess
 import textwrap
@@ -211,6 +212,9 @@ def tool_run_shell(agent, args):
     timeout = int(args.get("timeout", 20))
     if timeout < 1 or timeout > 120:
         raise ValueError("timeout must be in [1, 120]")
+    run_kwargs = {}
+    if os.name == "nt":
+        run_kwargs["executable"] = agent.shell_executable() if hasattr(agent, "shell_executable") else (os.environ.get("ComSpec") or os.environ.get("COMSPEC") or r"C:\Windows\System32\cmd.exe")
     result = subprocess.run(
         command,
         cwd=agent.root,
@@ -221,6 +225,7 @@ def tool_run_shell(agent, args):
         # 这里传入的是过滤后的环境变量，而不是直接继承整个父 shell 环境，
         # 目的是减少敏感信息被意外带进命令执行环境的风险。
         env=agent.shell_env(),
+        **run_kwargs,
     )
     return textwrap.dedent(
         f"""\

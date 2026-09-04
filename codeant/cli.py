@@ -35,6 +35,7 @@ HELP_DETAILS = textwrap.dedent(
     /help    Show this help message.
     /memory  Show the agent's distilled working memory.
     /session Show the path to the saved session file.
+    /proof   Show the latest AntProof status and evidence path.
     /reset   Clear the current session history and memory.
     /exit    Exit the agent.
     """
@@ -223,6 +224,7 @@ def build_welcome(agent, model, host):
             row("WORKSPACE  " + middle(agent.workspace.cwd, inner - 11)),
             pair("MODEL", model, "BRANCH", agent.workspace.branch),
             pair("APPROVAL", agent.approval_policy, "SESSION", agent.session["id"]),
+            pair("PROOF", agent.proof_mode, "CHECKS", str(len(agent.proof_contract.checks))),
             row(""),
         ]
     )
@@ -265,6 +267,10 @@ def build_agent(args):
             max_steps=args.max_steps,
             max_new_tokens=args.max_new_tokens,
             secret_env_names=configured_secret_names,
+            proof_mode=getattr(args, "proof", None),
+            proof_path=getattr(args, "proof_config", None),
+            verify_commands=getattr(args, "verify_commands", []),
+            proof_repair_rounds=getattr(args, "proof_repair_rounds", 2),
         )
     return CodeAnt(
         model_client=model,
@@ -274,6 +280,10 @@ def build_agent(args):
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
         secret_env_names=configured_secret_names,
+        proof_mode=getattr(args, "proof", None),
+        proof_path=getattr(args, "proof_config", None),
+        verify_commands=getattr(args, "verify_commands", []),
+        proof_repair_rounds=getattr(args, "proof_repair_rounds", 2),
     )
 
 
@@ -296,6 +306,16 @@ def build_arg_parser():
     parser.add_argument("--openai-timeout", type=int, default=300, help="OpenAI-compatible request timeout in seconds.")
     parser.add_argument("--resume", default=None, help="Session id to resume or 'latest'.")
     parser.add_argument("--approval", choices=("ask", "auto", "never"), default="ask", help="Approval policy for risky tools.")
+    parser.add_argument("--proof", choices=("off", "auto", "strict"), default=None, help="AntProof completion policy; defaults to proof.json mode or auto.")
+    parser.add_argument("--proof-config", default=None, help="Path to an AntProof JSON contract; defaults to .codeant/proof.json.")
+    parser.add_argument(
+        "--verify-command",
+        dest="verify_commands",
+        action="append",
+        default=[],
+        help="Required verification command; may be repeated and overrides configured checks.",
+    )
+    parser.add_argument("--proof-repair-rounds", type=int, default=2, help="Maximum repair rounds after failed AntProof checks.")
     parser.add_argument(
         "--secret-env-name",
         dest="secret_env_names",
@@ -312,7 +332,11 @@ def build_arg_parser():
 
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
-    agent = build_agent(args)
+    try:
+        agent = build_agent(args)
+    except ValueError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        return 2
 
     model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_OLLAMA_MODEL))
     host = getattr(agent.model_client, "host", getattr(agent.model_client, "base_url", getattr(args, "host", DEFAULT_OLLAMA_HOST)))
@@ -351,6 +375,9 @@ def main(argv=None):
             continue
         if user_input == "/session":
             print(agent.session_path)
+            continue
+        if user_input == "/proof":
+            print(agent.proof_summary())
             continue
         if user_input == "/reset":
             agent.reset()

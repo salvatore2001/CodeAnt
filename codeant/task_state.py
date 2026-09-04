@@ -4,7 +4,7 @@
 这个对象会被不断写入 task_state.json，供运行中观察和运行后复盘。
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import uuid4
 
@@ -22,6 +22,8 @@ STOP_REASON_APPROVAL_DENIED = "approval_denied"
 STOP_REASON_DELEGATE_FAILED = "delegate_failed"
 STOP_REASON_PERSISTENCE_ERROR = "persistence_error"
 STOP_REASON_RESUME_LOAD_ERROR = "resume_load_error"
+STOP_REASON_PROOF_FAILED = "proof_failed"
+STOP_REASON_PROOF_UNVERIFIED = "proof_unverified"
 
 
 @dataclass
@@ -37,6 +39,9 @@ class TaskState:
     final_answer: str = ""
     checkpoint_id: str = ""
     resume_status: str = ""
+    proof_status: str = "not_required"
+    verification_rounds: int = 0
+    failed_checks: list[str] = field(default_factory=list)
 
     @classmethod
     def create(cls, task_id, user_request, run_id=""):
@@ -58,7 +63,11 @@ class TaskState:
             final_answer=str(data.get("final_answer", "")),
             checkpoint_id=str(data.get("checkpoint_id", "")),
             resume_status=str(data.get("resume_status", "")),
+            proof_status=str(data.get("proof_status", "not_required")),
+            verification_rounds=int(data.get("verification_rounds", 0)),
+            failed_checks=list(data.get("failed_checks", []) or []),
         )
+
 
     def record_attempt(self):
         # attempt 统计的是“模型被调用了几轮”，不等于 tool_steps。
@@ -94,6 +103,18 @@ class TaskState:
         self.final_answer = str(final_answer)
         return self
 
+    def record_proof(self, status, failed_checks=None):
+        self.proof_status = str(status or "not_required")
+        self.verification_rounds += 1
+        self.failed_checks = [str(item) for item in (failed_checks or [])]
+        return self
+
+    def stop_proof_failed(self, final_answer=""):
+        return self.stop(STOP_REASON_PROOF_FAILED, status=STATUS_FAILED, final_answer=final_answer)
+
+    def stop_proof_unverified(self, final_answer=""):
+        return self.stop(STOP_REASON_PROOF_UNVERIFIED, status=STATUS_STOPPED, final_answer=final_answer)
+
     def to_dict(self):
         return {
             "run_id": self.run_id,
@@ -107,4 +128,7 @@ class TaskState:
             "final_answer": self.final_answer,
             "checkpoint_id": self.checkpoint_id,
             "resume_status": self.resume_status,
+            "proof_status": self.proof_status,
+            "verification_rounds": self.verification_rounds,
+            "failed_checks": list(self.failed_checks or []),
         }

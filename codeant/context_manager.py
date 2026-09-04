@@ -111,11 +111,19 @@ class ContextManager:
             "history": "",
             CURRENT_REQUEST_SECTION: f"Current user request:\n{user_message}",
         }
+        dynamic_prefix = []
         checkpoint_text = ""
         if hasattr(self.agent, "render_checkpoint_text"):
             checkpoint_text = str(self.agent.render_checkpoint_text() or "").strip()
         if checkpoint_text:
-            section_texts["prefix"] = section_texts["prefix"] + "\n\n" + checkpoint_text
+            dynamic_prefix.append(checkpoint_text)
+        proof_text = ""
+        if hasattr(self.agent, "render_proof_text"):
+            proof_text = str(self.agent.render_proof_text() or "").strip()
+        if proof_text:
+            dynamic_prefix.append(proof_text)
+        if dynamic_prefix:
+            section_texts["prefix"] = "\n\n".join([*dynamic_prefix, section_texts["prefix"]])
         selected_notes = []
         if memory_enabled and relevant_memory_enabled and hasattr(self.agent, "memory") and hasattr(self.agent.memory, "retrieval_candidates"):
             selected_notes = self.agent.memory.retrieval_candidates(user_message, limit=RELEVANT_MEMORY_LIMIT)
