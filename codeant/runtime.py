@@ -29,7 +29,7 @@ from .proof import (
     PROOF_STATUS_UNVERIFIED,
     PROOF_STATUS_VERIFIED,
 )
-from .planning import PlanEvent, PlanMode, PlanPhase, PlanSpec, PlanningGraph, StructuredPlanner
+from .planning import PlanEvent, PlanMode, PlanPhase, PlanSpec, PlanState, PlanningGraph, StructuredPlanner
 from .task_state import TaskState
 from . import tools as toolkit
 from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
@@ -119,6 +119,8 @@ class CodeAnt:
         proof_repair_rounds=2,
         plan_mode=None,
         plan_max_tokens=700,
+        plan_repair_rounds=2,
+        plan_max_replans=2,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -143,6 +145,8 @@ class CodeAnt:
             raise ValueError("plan mode must be one of: off, auto, strict")
         self.plan_mode = self.plan_mode_override or PlanMode.OFF.value
         self.plan_max_tokens = max(200, int(plan_max_tokens))
+        self.plan_repair_rounds = max(0, int(plan_repair_rounds))
+        self.plan_max_replans = max(0, int(plan_max_replans))
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".codeant" / "runs")
@@ -182,6 +186,8 @@ class CodeAnt:
         self.plan_state = None
         self.plan_error = ""
         self.plan_source = "none"
+        self.plan_replan_count = 0
+        self.plan_replan_history = []
         self.tools = self.build_tools()
         self.prefix_state = self.build_prefix()
         self.prefix = self.prefix_state.text
@@ -244,6 +250,8 @@ class CodeAnt:
             "proof_mode": self.proof_mode,
             "proof_contract_digest": self.proof_contract.digest if hasattr(self, "proof_contract") else "",
             "plan_mode": self.plan_mode,
+            "plan_repair_rounds": self.plan_repair_rounds,
+            "plan_max_replans": self.plan_max_replans,
         }
 
     def checkpoint_state(self):
@@ -718,6 +726,10 @@ class CodeAnt:
             "plan_phase": task_state.plan_phase,
             "current_step": task_state.current_step,
             "completed_steps": list(task_state.completed_steps),
+            "run_id": task_state.run_id,
+            "plan_artifact": str(self.run_store.plan_path(task_state)) if self.plan_mode != PlanMode.OFF.value else "",
+            "plan_replan_count": self.plan_replan_count,
+            "plan_replan_history": list(self.plan_replan_history),
         }
         state["items"][checkpoint_id] = checkpoint
         state["current_id"] = checkpoint_id
@@ -783,6 +795,7 @@ class CodeAnt:
                 "plan": self.plan.model_dump(mode="json"),
                 "state": self.plan_state.to_dict() if self.plan_state is not None else None,
                 "proof_contract_digest": self.proof_contract.digest,
+                "replan_history": list(self.plan_replan_history),
             }
         )
 
@@ -813,6 +826,108 @@ class CodeAnt:
         self._persist_plan_state()
         return self.plan_state
 
+    def _checkpoint_plan_path(self):
+        checkpoint = self.current_checkpoint()
+        if not checkpoint:
+            return None
+        raw_path = str(checkpoint.get("plan_artifact", "")).strip()
+        if not raw_path and checkpoint.get("run_id"):
+            raw_path = str(self.run_store.plan_path(checkpoint["run_id"]))
+        if not raw_path:
+            return None
+        candidate = Path(raw_path)
+        if not candidate.is_absolute():
+            candidate = self.root / candidate
+        try:
+            candidate = candidate.resolve()
+            runs_root = Path(self.run_store.root).resolve()
+            candidate.relative_to(runs_root)
+        except (ValueError, OSError):
+            return None
+        return candidate if candidate.is_file() else None
+
+    def restore_plan_from_checkpoint(self):
+        checkpoint = self.current_checkpoint()
+        if not checkpoint or checkpoint.get("plan_mode") in (None, PlanMode.OFF.value):
+            return False
+        if checkpoint.get("plan_phase") in {PlanPhase.COMPLETED.value, PlanPhase.FAILED.value}:
+            return False
+        path = self._checkpoint_plan_path()
+        if path is None:
+            return False
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            plan = PlanSpec.model_validate(payload["plan"])
+            state = PlanState.model_validate(payload["state"])
+            if state.plan.plan_id != plan.plan_id:
+                raise ValueError("checkpoint plan/state ids do not match")
+            self.plan = plan
+            self.plan_graph = PlanningGraph(plan)
+            self.plan_graph.state = state
+            self.plan_state = state
+            self.plan_replan_count = int(payload.get("replan_count", 0))
+            self.plan_replan_history = list(payload.get("replan_history", []) or [])
+            self.plan_source = "checkpoint"
+            self.plan_error = str(payload.get("error", ""))
+            self._persist_plan_state()
+            self.emit_trace(self.current_task_state, "plan_resumed", {
+                "plan_id": plan.plan_id,
+                "checkpoint_id": checkpoint.get("checkpoint_id", ""),
+                "current_step": state.current_step,
+                "completed_steps": list(state.completed_steps),
+            })
+            return True
+        except Exception as exc:
+            self.plan_error = f"checkpoint restore failed: {type(exc).__name__}: {exc}"
+            return False
+
+    def replan_plan(self, user_message, reason):
+        if self.plan_mode == PlanMode.OFF.value or self.plan is None:
+            return False
+        if self.plan_replan_count >= self.plan_max_replans:
+            if self.plan_state is not None:
+                self.plan_state = self.plan_state.model_copy(update={
+                    "phase": PlanPhase.BLOCKED,
+                    "current_step": "",
+                    "blocked_reason": f"automatic replanning limit reached ({self.plan_max_replans}): {reason}",
+                })
+                self._persist_plan_state()
+            self.emit_trace(self.current_task_state, "plan_replan_exhausted", {"reason": reason})
+            return False
+        old_plan = self.plan
+        self.emit_trace(self.current_task_state, "plan_replan_started", {
+            "plan_id": old_plan.plan_id, "reason": clip(reason, 500),
+            "attempt": self.plan_replan_count + 1,
+        })
+        planner = StructuredPlanner(self.model_client, max_new_tokens=self.plan_max_tokens, redact_fn=self.redact_text)
+        new_plan_id = "plan_" + uuid.uuid4().hex[:10]
+        context = f"Current plan {old_plan.plan_id} failed or was blocked. Reason: {reason}. " \
+                  f"Completed steps: {', '.join(self.plan_state.completed_steps if self.plan_state else [])}."
+        try:
+            new_plan = planner.generate(user_message, clip(self.workspace.text(), 6000), new_plan_id, planning_context=context)
+        except Exception as exc:
+            self.plan_replan_count += 1
+            entry = {"attempt": self.plan_replan_count, "status": "failed", "old_plan_id": old_plan.plan_id, "reason": clip(reason, 500), "error": f"{type(exc).__name__}: {exc}"}
+            self.plan_replan_history.append(entry)
+            self.plan_error = "replan failed: " + entry["error"]
+            self._persist_plan_state()
+            self.emit_trace(self.current_task_state, "plan_replan_failed", entry)
+            if self.plan_mode == PlanMode.STRICT.value and self.plan_state is not None:
+                self.plan_state = self.plan_state.model_copy(update={"phase": PlanPhase.FAILED, "current_step": ""})
+                self._persist_plan_state()
+            return False
+        self.plan_replan_count += 1
+        self.plan = new_plan
+        self.plan_graph = PlanningGraph(new_plan)
+        self.plan_state = self.plan_graph.advance()
+        self.plan_source = "replan"
+        self.plan_error = ""
+        entry = {"attempt": self.plan_replan_count, "status": "completed", "old_plan_id": old_plan.plan_id, "new_plan_id": new_plan.plan_id, "reason": clip(reason, 500)}
+        self.plan_replan_history.append(entry)
+        self._persist_plan_state()
+        self.emit_trace(self.current_task_state, "plan_replan_completed", entry)
+        return True
+
     def begin_plan(self, user_message):
         """Generate a typed plan, then initialize its deterministic LangGraph."""
         self.plan_mode = self.plan_mode_override or PlanMode.OFF.value
@@ -821,6 +936,8 @@ class CodeAnt:
         self.plan_state = None
         self.plan_error = ""
         self.plan_source = "none"
+        self.plan_replan_count = 0
+        self.plan_replan_history = []
         if self.current_task_state is not None:
             self.current_task_state.plan_mode = self.plan_mode
             self.current_task_state.record_plan(
@@ -830,6 +947,9 @@ class CodeAnt:
             self.run_store.write_task_state(self.current_task_state)
         if self.plan_mode == PlanMode.OFF.value:
             return None
+        if self.restore_plan_from_checkpoint():
+            return self.plan_state
+
 
         self.emit_trace(
             self.current_task_state,
@@ -1393,6 +1513,8 @@ class CodeAnt:
                             "phase": getattr(plan_state.phase, "value", plan_state.phase),
                         },
                     )
+                    if self.plan_state.phase == PlanPhase.BLOCKED:
+                        self.replan_plan(user_message, f"invalid plan step event: {step_id}")
                     continue
                 passed, evidence = self.verify_plan_step(step)
                 verification_summary = "step acceptance passed" if passed else "step acceptance failed"
@@ -1430,6 +1552,8 @@ class CodeAnt:
                         }
                     )
                     self.run_store.write_task_state(task_state)
+                    if self.plan_repair_rounds > 0 and self.plan_graph.current_step_failures() >= self.plan_repair_rounds:
+                        self.replan_plan(user_message, f"verification failure in step {step.id}")
                     continue
                 plan_state = self._advance_plan(
                     PlanEvent(
@@ -1456,7 +1580,14 @@ class CodeAnt:
                 args = payload.get("args", {})
                 task_state.record_tool(name)
                 tool_started_at = time.monotonic()
+                plan_failure_before = self.plan_graph.current_step_failures() if self.plan_graph is not None else 0
                 result = self.run_tool(name, args)
+                if (self.plan_state is not None and self.plan_state.current_step
+                        and self._last_tool_result_metadata.get("tool_status") in {"error", "partial_success", "rejected"}
+                        and self.plan_graph.current_step_failures() == plan_failure_before):
+                    self._advance_plan(PlanEvent(kind="step_verified", step_id=self.plan_state.current_step,
+                                                  passed=False, summary=f"{name} failed",
+                                                  evidence=[dict(self._last_tool_result_metadata)]))
                 self.record(
                     {
                         "role": "tool",
@@ -1478,6 +1609,10 @@ class CodeAnt:
                         **dict(self._last_tool_result_metadata or {}),
                     },
                 )
+                if (self.plan_state is not None and self.plan_repair_rounds > 0
+                        and self.plan_state.current_step
+                        and self.plan_graph.current_step_failures() >= self.plan_repair_rounds):
+                    self.replan_plan(user_message, f"tool failure in step {self.plan_state.current_step}")
                 checkpoint = self.create_checkpoint(task_state, user_message, trigger="tool_executed")
                 self.run_store.write_task_state(task_state)
                 self.emit_trace(
@@ -1535,6 +1670,8 @@ class CodeAnt:
                 )
                 continue
 
+            if self.plan_state is not None and self.plan_state.phase == PlanPhase.FAILED:
+                return self.finalize_plan_failure(task_state, user_message, final, run_started_at)
             if self.plan_state is not None and self.plan_state.phase == PlanPhase.BLOCKED:
                 return self.finalize_plan_blocked(task_state, user_message, final, run_started_at)
             if self.plan_mode == PlanMode.STRICT.value and self.plan_error:
@@ -1804,6 +1941,8 @@ class CodeAnt:
             "current_step": task_state.current_step,
             "completed_steps": list(task_state.completed_steps or []),
             "plan_artifact": str(self.run_store.plan_path(task_state)) if self.plan_mode != PlanMode.OFF.value else "",
+            "plan_replan_count": self.plan_replan_count,
+            "plan_replan_history": list(self.plan_replan_history),
             "plan": self._plan_artifact(),
         }
 
@@ -1817,6 +1956,7 @@ class CodeAnt:
             f"Mode: {self.plan_mode}",
             f"Steps: {len(self.plan.steps)}",
             f"Completed: {len(self.plan_state.completed_steps) if self.plan_state is not None else 0}",
+            f"Replans: {self.plan_replan_count}/{self.plan_max_replans}",
         ]
         if self.current_task_state is not None and self.plan_mode != PlanMode.OFF.value:
             lines.append(f"Evidence: {self.run_store.plan_path(self.current_task_state)}")
@@ -1887,13 +2027,25 @@ class CodeAnt:
     def _record_plan_tool_event(self, name, result):
         if self.plan_graph is None or self.plan_state is None or not self.plan_state.current_step:
             return
+        step_id = self.plan_state.current_step
         self._advance_plan(
             PlanEvent(
                 kind="tool_executed",
-                step_id=self.plan_state.current_step,
+                step_id=step_id,
                 summary=f"{name}: {clip(result, 300)}",
             )
         )
+        metadata = dict(self._last_tool_result_metadata or {})
+        if metadata.get("tool_status") in {"error", "partial_success", "rejected"}:
+            self._advance_plan(
+                PlanEvent(
+                    kind="step_verified",
+                    step_id=step_id,
+                    passed=False,
+                    summary=f"{name} failed",
+                    evidence=[metadata],
+                )
+            )
 
     def verify_plan_step(self, step):
         """Run step-level read-only checks through the AntProof approval boundary."""
@@ -2096,6 +2248,8 @@ class CodeAnt:
         self.plan_state = None
         self.plan_error = ""
         self.plan_source = "none"
+        self.plan_replan_count = 0
+        self.plan_replan_history = []
         self.plan_mode = PlanMode.OFF.value
         self.session_store.save(self.session)
 

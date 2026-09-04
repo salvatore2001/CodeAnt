@@ -187,3 +187,9 @@ uv run codeant --plan strict --plan-max-tokens 900
 每次启用规划的运行会在 `.codeant/runs/<run_id>/plan.json` 保存脱敏的计划、状态和事件；模型完成步骤时可发送 `<plan_step_done id="step-id">evidence</plan_step_done>`，运行时会校验步骤和依赖并更新当前步骤。REPL 中可使用 `/plan` 查看计划摘要。
 
 步骤还可以声明 `allowed_tools`、`allowed_paths` 和 `verification_commands`。启用这些约束后，CodeAnt 会在工具执行前拦截越权操作，并在接受 `<plan_step_done>` 前通过 AntProof 审批边界运行步骤级验证；验证失败会保留当前步骤并把证据反馈给模型。
+
+### v0.5 失败修复、自动重规划与断点恢复
+
+启用规划后，工具拒绝、工具执行错误或步骤验收失败都会写入 `failure_counts` 与验证证据。达到 `--plan-repair-rounds` 后，CodeAnt 会把失败原因和已完成步骤交给规划器生成新计划；`--plan-max-replans` 控制每次请求的重规划上限，达到上限时会以可解释的阻塞状态停止。`plan.json`、检查点和运行报告会保存重规划历史。
+
+每次工具执行都会创建检查点，检查点包含计划产物路径、当前步骤、已完成步骤和重规划历史。使用 `--resume <session-id>`（或 `--resume latest`）时，CodeAnt 会校验检查点和工作区新鲜度，恢复未完成计划并从当前步骤继续，不会重复调用初始规划器。

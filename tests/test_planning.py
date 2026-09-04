@@ -4,7 +4,7 @@ import pytest
 
 from codeant import FakeModelClient, MiniAgent, SessionStore, WorkspaceContext
 from codeant.planning import PlanEvent, PlanSpec, PlanStep, PlanningGraph
-from codeant.task_state import STOP_REASON_PLAN_FAILED
+from codeant.task_state import STOP_REASON_PLAN_FAILED, TaskState
 
 
 def build_agent(tmp_path, outputs, plan_mode="auto"):
@@ -181,3 +181,77 @@ def test_step_verification_evidence_is_required_before_completion(tmp_path):
     artifact = agent.run_store.load_plan(agent.current_task_state)
     assert artifact["state"]["completed_steps"] == ["verify"]
     assert artifact["state"]["step_verifications"]["verify"][0]["status"] == "passed"
+
+
+def test_failed_verification_triggers_automatic_replan(tmp_path):
+    first_plan = {
+        "goal": "repair a failing check",
+        "steps": [{"id": "verify", "objective": "run the failing check", "verification_commands": ["python -c \"import sys; sys.exit(1)\""]}],
+    }
+    second_plan = {
+        "goal": "repair a failing check",
+        "steps": [{"id": "verify_fixed", "objective": "run the fixed check"}],
+    }
+    agent = build_agent(
+        tmp_path,
+        [json.dumps(first_plan),
+         '<plan_step_done id="verify">first attempt</plan_step_done>',
+         '<plan_step_done id="verify">second attempt</plan_step_done>',
+         json.dumps(second_plan),
+         '<plan_step_done id="verify_fixed">fixed</plan_step_done>',
+         '<final>Done.</final>'],
+    )
+    agent.plan_repair_rounds = 2
+    agent.plan_max_replans = 1
+
+    answer = agent.ask("Repair the failing check")
+
+    assert "Plan: COMPLETED" in answer
+    assert agent.plan_replan_count == 1
+    assert agent.plan_replan_history[0]["status"] == "completed"
+    assert agent.current_task_state.plan_id == agent.plan.plan_id
+    assert agent.plan.plan_id != ""
+
+
+def test_plan_checkpoint_resume_restores_unfinished_plan(tmp_path):
+    plan = {
+        "goal": "finish two steps",
+        "steps": [
+            {"id": "first", "objective": "finish first", "allowed_tools": ["read_file"]},
+            {"id": "second", "objective": "finish second", "depends_on": ["first"], "allowed_tools": ["read_file"]},
+        ],
+    }
+    first = build_agent(tmp_path, [json.dumps(plan)])
+    first.current_task_state = TaskState.create(
+        run_id=first.new_run_id(), task_id=first.new_task_id(), user_request="Finish two steps"
+    )
+    first.current_run_dir = first.run_store.start_run(first.current_task_state)
+    first.begin_proof()
+    first.begin_plan("Finish two steps")
+    first._advance_plan(PlanEvent(kind="step_done", step_id="first", summary="first done"))
+    first.create_checkpoint(first.current_task_state, "Finish two steps", trigger="test_resume")
+    checkpoint = first.current_checkpoint()
+    assert checkpoint["plan_phase"] == "executing"
+    assert checkpoint["current_step"] == "second"
+    assert checkpoint["plan_artifact"]
+
+    second = MiniAgent.from_session(
+        model_client=FakeModelClient([
+            '<plan_step_done id="second">second done</plan_step_done>',
+            '<final>Done.</final>',
+        ]),
+        workspace=WorkspaceContext.build(tmp_path),
+        session_store=first.session_store,
+        session_id=first.session["id"],
+        approval_policy="auto",
+        proof_mode="off",
+        plan_mode="auto",
+        plan_max_tokens=500,
+        max_steps=5,
+    )
+    answer = second.ask("Finish two steps")
+
+    assert "Plan: COMPLETED" in answer
+    assert second.plan_source == "checkpoint"
+    assert second.plan_state.completed_steps == ["first", "second"]
+    assert len(second.model_client.prompts) == 2

@@ -131,6 +131,7 @@ class PlanState(BaseModel):
     blocked_reason: str = ""
     events: list[dict[str, Any]] = Field(default_factory=list)
     step_verifications: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
+    failure_counts: dict[str, int] = Field(default_factory=dict)
     event: PlanEvent | None = None
 
     def to_dict(self):
@@ -152,10 +153,15 @@ def _apply_event(state: PlanState):
             completed_steps=[],
             blocked_reason="",
             step_verifications={},
+            failure_counts={},
         )
     elif event.kind == "step_verified" and event.step_id:
         verifications[event.step_id] = list(event.evidence)
         updates["step_verifications"] = verifications
+        failures = dict(state.failure_counts)
+        if not event.passed:
+            failures[event.step_id] = int(failures.get(event.step_id, 0)) + 1
+        updates["failure_counts"] = failures
     elif event.kind == "step_done" and event.step_id:
         known_ids = {step.id for step in state.plan.steps}
         if event.step_id not in known_ids:
@@ -281,6 +287,9 @@ class PlanningGraph:
     def mark_step_blocked(self, reason):
         return self.advance(PlanEvent(kind="step_blocked", summary=reason))
 
+    def current_step_failures(self, step_id=None):
+        return int(self.state.failure_counts.get(step_id or self.state.current_step, 0))
+
     def current_step_spec(self):
         step_id = self.state.current_step
         return next((step for step in self.state.plan.steps if step.id == step_id), None)
@@ -317,7 +326,8 @@ class StructuredPlanner:
         self.max_new_tokens = max_new_tokens
         self.redact_fn = redact_fn or (lambda value: str(value))
 
-    def build_prompt(self, user_message: str, workspace_summary: str):
+    def build_prompt(self, user_message: str, workspace_summary: str, planning_context: str = ""):
+        context_suffix = f"\n\nFailure context:\n{self.redact_fn(planning_context)}" if planning_context else ""
         return (
             "You are CodeAnt's planning agent. Return ONLY one valid JSON object "
             "matching the PlanSpec schema below; do not use markdown.\n"
@@ -329,12 +339,12 @@ class StructuredPlanner:
             "allowed_paths restricts file mutations; verification_commands must be read-only checks.\n"
             "Create a short acyclic plan. Never invent files or claim tests passed.\n\n"
             f"User request:\n{self.redact_fn(user_message)}\n\n"
-            f"Workspace summary:\n{self.redact_fn(workspace_summary)}"
+            f"Workspace summary:\n{self.redact_fn(workspace_summary)}" + context_suffix
         )
 
-    def generate(self, user_message: str, workspace_summary: str, plan_id: str):
+    def generate(self, user_message: str, workspace_summary: str, plan_id: str, planning_context: str = ""):
         raw = self.model_client.complete(
-            self.build_prompt(user_message, workspace_summary),
+            self.build_prompt(user_message, workspace_summary, planning_context),
             self.max_new_tokens,
         )
         payload = extract_json_object(raw)

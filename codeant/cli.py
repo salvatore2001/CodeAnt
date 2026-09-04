@@ -275,6 +275,8 @@ def build_agent(args):
             proof_repair_rounds=getattr(args, "proof_repair_rounds", 2),
             plan_mode=getattr(args, "plan", None),
             plan_max_tokens=getattr(args, "plan_max_tokens", 700),
+            plan_repair_rounds=getattr(args, "plan_repair_rounds", 2),
+            plan_max_replans=getattr(args, "plan_max_replans", 2),
         )
     return CodeAnt(
         model_client=model,
@@ -290,6 +292,8 @@ def build_agent(args):
         proof_repair_rounds=getattr(args, "proof_repair_rounds", 2),
         plan_mode=getattr(args, "plan", None),
         plan_max_tokens=getattr(args, "plan_max_tokens", 700),
+        plan_repair_rounds=getattr(args, "plan_repair_rounds", 2),
+        plan_max_replans=getattr(args, "plan_max_replans", 2),
     )
 
 
@@ -324,6 +328,8 @@ def build_arg_parser():
     parser.add_argument("--proof-repair-rounds", type=int, default=2, help="Maximum repair rounds after failed AntProof checks.")
     parser.add_argument("--plan", choices=("off", "auto", "strict"), default=None, help="Structured planning mode; off preserves the legacy loop.")
     parser.add_argument("--plan-max-tokens", type=int, default=700, help="Maximum model output tokens used to generate a plan.")
+    parser.add_argument("--plan-repair-rounds", type=int, default=2, help="Failed verification rounds before automatic replanning.")
+    parser.add_argument("--plan-max-replans", type=int, default=2, help="Maximum automatic replans per request.")
     parser.add_argument(
         "--secret-env-name",
         dest="secret_env_names",
