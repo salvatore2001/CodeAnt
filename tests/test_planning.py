@@ -110,3 +110,74 @@ def test_strict_planning_failure_does_not_complete_task(tmp_path):
     assert "Plan: FAILED" in answer
     assert agent.current_task_state.status == "failed"
     assert agent.current_task_state.stop_reason == STOP_REASON_PLAN_FAILED
+
+def test_planning_graph_blocks_out_of_order_step():
+    plan = PlanSpec(
+        plan_id="p-order",
+        goal="demo",
+        steps=[
+            PlanStep(id="first", objective="first"),
+            PlanStep(id="second", objective="second", depends_on=["first"]),
+        ],
+    )
+    graph = PlanningGraph(plan)
+    graph.advance()
+
+    blocked = graph.mark_step_done("second")
+
+    assert blocked.phase.value == "blocked"
+    assert "current step is first" in blocked.blocked_reason
+
+
+def test_plan_gate_rejects_disallowed_tool_and_path(tmp_path):
+    agent = build_agent(tmp_path, [], plan_mode="auto")
+    agent.plan = PlanSpec(
+        plan_id="p-gate",
+        goal="edit source",
+        steps=[
+            PlanStep(
+                id="edit",
+                objective="edit source",
+                allowed_tools=["patch_file"],
+                allowed_paths=["src/**"],
+            )
+        ],
+    )
+    agent.plan_graph = PlanningGraph(agent.plan)
+    agent.plan_state = agent.plan_graph.advance()
+
+    result = agent.run_tool("write_file", {"path": "src/main.py", "content": "pass\n"})
+    assert "plan gate denied" in result
+    assert not (tmp_path / "src" / "main.py").exists()
+
+    result = agent.run_tool(
+        "patch_file",
+        {"path": "README.md", "old_text": "demo", "new_text": "changed"},
+    )
+    assert "outside plan step 'edit' allowed_paths" in result
+    assert (tmp_path / "README.md").read_text(encoding="utf-8") == "demo\n"
+
+
+def test_step_verification_evidence_is_required_before_completion(tmp_path):
+    plan_payload = {
+        "goal": "verify README",
+        "steps": [
+            {
+                "id": "verify",
+                "objective": "verify README",
+                "allowed_tools": ["read_file"],
+                "verification_commands": ["python -c \"import sys; sys.exit(0)\""],
+            }
+        ],
+    }
+    agent = build_agent(
+        tmp_path,
+        [json.dumps(plan_payload), '<plan_step_done id="verify">check passed</plan_step_done>', "<final>Done.</final>"],
+    )
+
+    answer = agent.ask("Verify README")
+
+    assert "Plan: COMPLETED" in answer
+    artifact = agent.run_store.load_plan(agent.current_task_state)
+    assert artifact["state"]["completed_steps"] == ["verify"]
+    assert artifact["state"]["step_verifications"]["verify"][0]["status"] == "passed"

@@ -1,7 +1,7 @@
 from .cli import build_agent, build_arg_parser, build_welcome, main
 from .models import AnthropicCompatibleModelClient, FakeModelClient, OllamaModelClient, OpenAICompatibleModelClient
 from .runtime import MiniAgent, CodeAnt, SessionStore
-from .planning import PlanEvent, PlanMode, PlanPhase, PlanSpec, PlanState, PlanStep, PlanningGraph, StructuredPlanner
+from .planning import PLAN_TOOL_NAMES, PlanEvent, PlanMode, PlanPhase, PlanSpec, PlanState, PlanStep, PlanningGraph, StructuredPlanner
 from .workspace import WorkspaceContext
 
 __all__ = [
@@ -17,6 +17,7 @@ __all__ = [
     "OpenAICompatibleModelClient",
     "SessionStore",
     "WorkspaceContext",
+    "PLAN_TOOL_NAMES",
     "PlanEvent",
     "PlanMode",
     "PlanPhase",

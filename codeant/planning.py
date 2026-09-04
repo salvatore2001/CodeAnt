@@ -1,11 +1,4 @@
-"""Typed task planning and LangGraph orchestration for CodeAnt.
-
-The planner is intentionally separate from the existing model/tool loop.  A
-``PlanSpec`` is a small, validated contract; ``PlanningGraph`` advances that
-contract through deterministic state transitions.  This lets CodeAnt adopt
-structured planning without giving a language model direct control over the
-workflow graph.
-"""
+"""Typed task planning and LangGraph orchestration for CodeAnt."""
 
 from __future__ import annotations
 
@@ -15,6 +8,11 @@ from typing import Any, Callable, Literal
 
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+
+PLAN_TOOL_NAMES = frozenset(
+    {"list_files", "read_file", "search", "run_shell", "write_file", "patch_file", "delegate"}
+)
 
 
 class PlanMode(str, Enum):
@@ -39,8 +37,11 @@ class PlanStep(BaseModel):
     id: str = Field(min_length=1, max_length=80)
     objective: str = Field(min_length=1, max_length=500)
     depends_on: list[str] = Field(default_factory=list)
+    allowed_tools: list[str] = Field(default_factory=list)
     allowed_paths: list[str] = Field(default_factory=list)
     acceptance_criteria: list[str] = Field(default_factory=list)
+    verification_commands: list[str] = Field(default_factory=list)
+    verification_timeout: int = Field(default=60, ge=1, le=120)
     risk: Literal["low", "medium", "high"] = "low"
     status: Literal["pending", "in_progress", "completed", "blocked"] = "pending"
 
@@ -68,6 +69,9 @@ class PlanSpec(BaseModel):
                 raise ValueError(f"step {step.id} depends on unknown steps: {', '.join(unknown)}")
             if step.id in step.depends_on:
                 raise ValueError(f"step {step.id} cannot depend on itself")
+            unknown_tools = sorted(set(step.allowed_tools) - PLAN_TOOL_NAMES)
+            if unknown_tools:
+                raise ValueError(f"step {step.id} uses unknown tools: {', '.join(unknown_tools)}")
         self._validate_acyclic()
         return self
 
@@ -110,9 +114,11 @@ class PlanSpec(BaseModel):
 class PlanEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["step_done", "step_blocked", "tool_executed", "reset"]
+    kind: Literal["step_done", "step_blocked", "step_verified", "tool_executed", "reset"]
     step_id: str = ""
     summary: str = ""
+    passed: bool = True
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class PlanState(BaseModel):
@@ -124,6 +130,7 @@ class PlanState(BaseModel):
     completed_steps: list[str] = Field(default_factory=list)
     blocked_reason: str = ""
     events: list[dict[str, Any]] = Field(default_factory=list)
+    step_verifications: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
     event: PlanEvent | None = None
 
     def to_dict(self):
@@ -137,13 +144,18 @@ def _apply_event(state: PlanState):
     updates: dict[str, Any] = {
         "events": [*state.events, event.model_dump(mode="json")],
     }
+    verifications = {key: list(value) for key, value in state.step_verifications.items()}
     if event.kind == "reset":
         updates.update(
             phase=PlanPhase.PLANNING,
             current_step="",
             completed_steps=[],
             blocked_reason="",
+            step_verifications={},
         )
+    elif event.kind == "step_verified" and event.step_id:
+        verifications[event.step_id] = list(event.evidence)
+        updates["step_verifications"] = verifications
     elif event.kind == "step_done" and event.step_id:
         known_ids = {step.id for step in state.plan.steps}
         if event.step_id not in known_ids:
@@ -152,11 +164,38 @@ def _apply_event(state: PlanState):
                 "phase": PlanPhase.BLOCKED,
                 "current_step": "",
                 "blocked_reason": f"unknown plan step: {event.step_id}",
+                "step_verifications": verifications,
+            }
+        if state.current_step and event.step_id != state.current_step and event.step_id not in state.completed_steps:
+            return {
+                **updates,
+                "phase": PlanPhase.BLOCKED,
+                "current_step": "",
+                "blocked_reason": f"cannot complete step {event.step_id}; current step is {state.current_step}",
+                "step_verifications": verifications,
+            }
+        step = next(step for step in state.plan.steps if step.id == event.step_id)
+        missing = sorted(set(step.depends_on) - set(state.completed_steps))
+        if missing:
+            return {
+                **updates,
+                "phase": PlanPhase.BLOCKED,
+                "current_step": "",
+                "blocked_reason": f"step {event.step_id} has incomplete dependencies: {', '.join(missing)}",
+                "step_verifications": verifications,
             }
         completed = list(dict.fromkeys([*state.completed_steps, event.step_id]))
+        if event.evidence:
+            verifications[event.step_id] = list(event.evidence)
+        updates["step_verifications"] = verifications
         updates.update(completed_steps=completed, blocked_reason="")
     elif event.kind == "step_blocked":
-        updates.update(phase=PlanPhase.BLOCKED, blocked_reason=event.summary or "step blocked")
+        updates.update(
+            phase=PlanPhase.BLOCKED,
+            current_step="",
+            blocked_reason=event.summary or "step blocked",
+            step_verifications=verifications,
+        )
     return updates
 
 
@@ -193,12 +232,7 @@ def _route(state: PlanState):
 
 
 def build_planning_graph():
-    """Build a deterministic LangGraph that advances one planning event.
-
-    The graph does not execute shell or file tools.  CodeAnt remains the only
-    owner of side effects; the graph decides which validated plan step should
-    be active next.  This boundary keeps the workflow auditable and testable.
-    """
+    """Build a deterministic LangGraph that advances one planning event."""
 
     graph = StateGraph(PlanState)
     graph.add_node("apply_event", _apply_event)
@@ -228,11 +262,28 @@ class PlanningGraph:
             self.state = PlanState.model_validate(self.state)
         return self.state
 
-    def mark_step_done(self, step_id: str, summary=""):
-        return self.advance(PlanEvent(kind="step_done", step_id=step_id, summary=summary))
+    def mark_step_done(self, step_id: str, summary="", evidence=None):
+        return self.advance(
+            PlanEvent(kind="step_done", step_id=step_id, summary=summary, evidence=evidence or [])
+        )
+
+    def mark_step_verified(self, step_id: str, passed: bool, evidence=None, summary=""):
+        return self.advance(
+            PlanEvent(
+                kind="step_verified",
+                step_id=step_id,
+                passed=passed,
+                evidence=evidence or [],
+                summary=summary,
+            )
+        )
 
     def mark_step_blocked(self, reason):
         return self.advance(PlanEvent(kind="step_blocked", summary=reason))
+
+    def current_step_spec(self):
+        step_id = self.state.current_step
+        return next((step for step in self.state.plan.steps if step.id == step_id), None)
 
 
 def extract_json_object(raw: str):
@@ -241,7 +292,7 @@ def extract_json_object(raw: str):
     text = str(raw or "").strip()
     if text.startswith("```"):
         lines = text.splitlines()
-        text = "\n".join(line for line in lines if not line.strip().startswith("```")).strip()
+        text = "\n".join(line for line in lines if not line.strip().startswith("```")) .strip()
     try:
         value = json.loads(text)
     except json.JSONDecodeError:
@@ -272,7 +323,10 @@ class StructuredPlanner:
             "matching the PlanSpec schema below; do not use markdown.\n"
             "PlanSpec fields: schema_version=1, plan_id, goal, assumptions[], "
             "steps[], proof_checks[], budget_steps. Each step has id, objective, "
-            "depends_on[], allowed_paths[], acceptance_criteria[], risk(low|medium|high).\n"
+            "depends_on[], allowed_tools[], allowed_paths[], acceptance_criteria[], "
+            "verification_commands[], verification_timeout, risk(low|medium|high).\n"
+            "Use only these tools: list_files, read_file, search, run_shell, write_file, patch_file, delegate. "
+            "allowed_paths restricts file mutations; verification_commands must be read-only checks.\n"
             "Create a short acyclic plan. Never invent files or claim tests passed.\n\n"
             f"User request:\n{self.redact_fn(user_message)}\n\n"
             f"Workspace summary:\n{self.redact_fn(workspace_summary)}"
@@ -291,6 +345,7 @@ class StructuredPlanner:
 
 
 __all__ = [
+    "PLAN_TOOL_NAMES",
     "PlanEvent",
     "PlanMode",
     "PlanPhase",

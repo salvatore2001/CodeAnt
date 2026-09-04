@@ -168,6 +168,7 @@ uv run codeant --verify-command "python -m pytest -q"
 `auto` 在没有契约时保持兼容并跳过验证；`strict` 没有契约或必需检查未通过时不会把任务标记为成功；`off` 完全关闭 AntProof。每次运行的验证结果会写入 `.codeant/runs/<run_id>/proof.json`，并可在 REPL 中用 `/proof` 查看。
 
 安全提示：proof 配置中的验证命令会以当前用户权限在工作区执行，和运行测试脚本一样属于可执行代码。只对信任的仓库启用自动审批，并检查 `.codeant/proof.json` 内容；审批策略仍由 `--approval` 控制。
+
 ## 结构化任务规划
 
 CodeAnt 支持采用 Pydantic + LangGraph 的结构化任务规划：Pydantic 负责校验计划、步骤依赖、风险和验收标准；LangGraph 负责按依赖推进步骤状态，不直接执行文件或 shell 副作用。
@@ -184,3 +185,5 @@ uv run codeant --plan strict --plan-max-tokens 900
 - `strict`：规划生成失败会阻止任务被标记为成功。
 
 每次启用规划的运行会在 `.codeant/runs/<run_id>/plan.json` 保存脱敏的计划、状态和事件；模型完成步骤时可发送 `<plan_step_done id="step-id">evidence</plan_step_done>`，运行时会校验步骤和依赖并更新当前步骤。REPL 中可使用 `/plan` 查看计划摘要。
+
+步骤还可以声明 `allowed_tools`、`allowed_paths` 和 `verification_commands`。启用这些约束后，CodeAnt 会在工具执行前拦截越权操作，并在接受 `<plan_step_done>` 前通过 AntProof 审批边界运行步骤级验证；验证失败会保留当前步骤并把证据反馈给模型。

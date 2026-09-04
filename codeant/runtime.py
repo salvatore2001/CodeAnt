@@ -4,6 +4,7 @@ CodeAnt 就是包在模型外面的控制循环：负责组 prompt、解析模�
 校验并执行工具、写 trace、更新工作记忆，以及在合适的时候停下来。
 """
 
+import fnmatch
 import json
 import os
 import re
@@ -20,6 +21,7 @@ from .context_manager import ContextManager
 from .run_store import RunStore
 from .proof import (
     AntProofEngine,
+    ProofCheck,
     ProofContract,
     PROOF_STATUS_FAILED,
     PROOF_STATUS_NOT_REQUIRED,
@@ -755,9 +757,15 @@ class CodeAnt:
             lines.append(f"- [{status}] {step.id}: {self.redact_text(step.objective)}")
             if step.depends_on:
                 lines.append("  depends_on: " + ", ".join(step.depends_on))
+            if step.allowed_tools:
+                lines.append("  allowed_tools: " + ", ".join(step.allowed_tools))
+            if step.allowed_paths:
+                lines.append("  allowed_paths: " + ", ".join(step.allowed_paths))
             if step.acceptance_criteria:
                 criteria = "; ".join(self.redact_text(item) for item in step.acceptance_criteria)
                 lines.append("  acceptance: " + criteria)
+            if step.verification_commands:
+                lines.append("  verification_commands: " + "; ".join(self.redact_text(item) for item in step.verification_commands))
         lines.append(
             'When a step is complete, emit <plan_step_done id="step_id">brief evidence</plan_step_done> before continuing.'
         )
@@ -860,12 +868,32 @@ class CodeAnt:
         )
         return self.plan_state
 
+    def plan_requires_completion(self):
+        if self.plan is None:
+            return False
+        return any(
+            step.allowed_tools or step.allowed_paths or step.verification_commands
+            for step in self.plan.steps
+        )
+
     def complete_plan(self):
         if self.plan_state is None or self.plan_state.phase == PlanPhase.BLOCKED:
             return
-        self.plan_state = self.plan_state.model_copy(
-            update={"phase": PlanPhase.COMPLETED, "current_step": ""}
-        )
+        completed = set(self.plan_state.completed_steps)
+        required = {step.id for step in self.plan.steps}
+        if self.plan_requires_completion() and completed != required:
+            unresolved = sorted(required - completed)
+            self.plan_state = self.plan_state.model_copy(
+                update={
+                    "phase": PlanPhase.BLOCKED,
+                    "current_step": "",
+                    "blocked_reason": "cannot finish plan; incomplete steps: " + ", ".join(unresolved),
+                }
+            )
+        else:
+            self.plan_state = self.plan_state.model_copy(
+                update={"phase": PlanPhase.COMPLETED, "current_step": ""}
+            )
         self._persist_plan_state()
 
     def plan_final_answer(self, final):
@@ -905,6 +933,31 @@ class CodeAnt:
         )
         self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
         return authoritative_final
+    def finalize_plan_blocked(self, task_state, user_message, final, run_started_at):
+        authoritative_final = self.plan_final_answer(final)
+        task_state.stop_plan_blocked(authoritative_final)
+        self.promote_durable_memory(user_message, final)
+        self.run_store.write_task_state(task_state)
+        checkpoint = self.create_checkpoint(task_state, user_message, trigger="plan_blocked")
+        self.emit_trace(
+            task_state,
+            "checkpoint_created",
+            {"checkpoint_id": checkpoint["checkpoint_id"], "trigger": "plan_blocked"},
+        )
+        self.emit_trace(
+            task_state,
+            "run_finished",
+            {
+                "status": task_state.status,
+                "stop_reason": task_state.stop_reason,
+                "final_answer": authoritative_final,
+                "plan_phase": task_state.plan_phase,
+                "run_duration_ms": int((time.monotonic() - run_started_at) * 1000),
+            },
+        )
+        self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
+        return authoritative_final
+
     def render_proof_text(self):
         """Render the immutable contract and latest result for the model."""
         if not self.proof_contract.configured:
@@ -1325,18 +1378,72 @@ class CodeAnt:
                         }
                     )
                     continue
+                step_id = str(payload.get("step_id", "")).strip()
+                step = self.current_plan_step()
+                if step is None or step.id != step_id:
+                    plan_state = self._advance_plan(
+                        PlanEvent(kind="step_done", step_id=step_id, summary=str(payload.get("summary", "")))
+                    )
+                    self.emit_trace(
+                        task_state,
+                        "plan_step_blocked",
+                        {
+                            "step_id": step_id,
+                            "reason": plan_state.blocked_reason,
+                            "phase": getattr(plan_state.phase, "value", plan_state.phase),
+                        },
+                    )
+                    continue
+                passed, evidence = self.verify_plan_step(step)
+                verification_summary = "step acceptance passed" if passed else "step acceptance failed"
+                plan_state = self._advance_plan(
+                    PlanEvent(
+                        kind="step_verified",
+                        step_id=step.id,
+                        summary=verification_summary,
+                        passed=passed,
+                        evidence=evidence,
+                    )
+                )
+                self.emit_trace(
+                    task_state,
+                    "plan_step_verified",
+                    {
+                        "step_id": step.id,
+                        "passed": passed,
+                        "checks": evidence,
+                        "phase": getattr(plan_state.phase, "value", plan_state.phase),
+                    },
+                )
+                if not passed:
+                    feedback = "Plan step acceptance failed. Fix the reported checks, then emit plan_step_done again."
+                    for check in evidence:
+                        if check.get("status") != "passed":
+                            feedback += f"\n- {check.get('id')}: {check.get('stderr') or check.get('stdout') or check.get('status')}"
+                    self.record(
+                        {
+                            "role": "tool",
+                            "name": "plan_verifier",
+                            "args": {"step_id": step.id},
+                            "content": self.redact_text(feedback),
+                            "created_at": now(),
+                        }
+                    )
+                    self.run_store.write_task_state(task_state)
+                    continue
                 plan_state = self._advance_plan(
                     PlanEvent(
                         kind="step_done",
-                        step_id=str(payload.get("step_id", "")),
+                        step_id=step.id,
                         summary=str(payload.get("summary", "")),
+                        evidence=evidence,
                     )
                 )
                 self.emit_trace(
                     task_state,
                     "plan_step_completed",
                     {
-                        "step_id": payload.get("step_id", ""),
+                        "step_id": step.id,
                         "summary": clip(payload.get("summary", ""), 300),
                         "phase": getattr(plan_state.phase, "value", plan_state.phase),
                         "current_step": plan_state.current_step,
@@ -1428,11 +1535,15 @@ class CodeAnt:
                 )
                 continue
 
+            if self.plan_state is not None and self.plan_state.phase == PlanPhase.BLOCKED:
+                return self.finalize_plan_blocked(task_state, user_message, final, run_started_at)
             if self.plan_mode == PlanMode.STRICT.value and self.plan_error:
                 self.plan_state = self.plan_state.model_copy(update={"phase": PlanPhase.FAILED, "current_step": ""})
                 self._persist_plan_state()
                 return self.finalize_plan_failure(task_state, user_message, final, run_started_at)
             self.complete_plan()
+            if self.plan_state is not None and self.plan_state.phase == PlanPhase.BLOCKED:
+                return self.finalize_plan_blocked(task_state, user_message, final, run_started_at)
             authoritative_final = self.plan_final_answer(self.proof_final_answer(final, proof_result))
             if not proof_result.passed:
                 if proof_result.status == PROOF_STATUS_UNVERIFIED:
@@ -1532,6 +1643,21 @@ class CodeAnt:
                 "diff_summary": [],
             }
             return f"error: unknown tool '{name}'"
+        plan_error = self.plan_gate_error(name, args)
+        if plan_error:
+            self._last_tool_result_metadata = {
+                "tool_status": "rejected",
+                "tool_error_code": "plan_gate_denied",
+                "security_event_type": "plan_gate_denied",
+                "risk_level": "high" if tool["risky"] else "low",
+                "read_only": not tool["risky"],
+                "affected_paths": [],
+                "workspace_changed": False,
+                "diff_summary": [],
+                "plan_step": self.plan_state.current_step if self.plan_state is not None else "",
+            }
+            self.record_process_note_for_tool(name, self._last_tool_result_metadata)
+            return f"error: plan gate denied: {plan_error}"
         try:
             self.validate_tool(name, args)
         except Exception as exc:
@@ -1606,6 +1732,7 @@ class CodeAnt:
                 "diff_summary": diff_summary,
             }
             self.record_process_note_for_tool(name, self._last_tool_result_metadata)
+            self._record_plan_tool_event(name, result)
             return result
         except Exception as exc:
             after_snapshot = self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
@@ -1624,7 +1751,9 @@ class CodeAnt:
                 "diff_summary": diff_summary,
             }
             self.record_process_note_for_tool(name, self._last_tool_result_metadata)
-            return f"error: tool {name} failed: {exc}"
+            error_result = f"error: tool {name} failed: {exc}"
+            self._record_plan_tool_event(name, error_result)
+            return error_result
 
     def repeated_tool_call(self, name, args):
         # agent 很常见的一种坏循环，是在没有新信息的情况下反复发起同一调用。
@@ -1714,6 +1843,70 @@ class CodeAnt:
         return "\n".join(lines)
     def tool_example(self, name):
         return toolkit.tool_example(name)
+
+    def current_plan_step(self):
+        if self.plan_graph is None or self.plan_state is None:
+            return None
+        return self.plan_graph.current_step_spec()
+
+    @staticmethod
+    def _plan_path_matches(path, patterns):
+        normalized = str(path).replace("\\", "/").lstrip("/")
+        return any(
+            fnmatch.fnmatch(normalized, str(pattern).replace("\\", "/").lstrip("/"))
+            or Path(normalized).match(str(pattern).replace("\\", "/").lstrip("/"))
+            for pattern in patterns
+        )
+
+    def plan_gate_error(self, name, args):
+        """Return a deterministic error when a plan step disallows a tool action."""
+        if self.plan_mode == PlanMode.OFF.value:
+            return ""
+        state = self.plan_state
+        if state is None or self.plan_graph is None:
+            return "structured plan is not initialized"
+        if state.phase in {PlanPhase.BLOCKED, PlanPhase.FAILED}:
+            return f"structured plan is {state.phase.value}: {state.blocked_reason or 'execution is blocked'}"
+        if state.phase == PlanPhase.COMPLETED or not state.current_step:
+            return "structured plan has no active step"
+        step = self.current_plan_step()
+        if step is None:
+            return f"structured plan references unknown current step: {state.current_step}"
+        if step.allowed_tools and name not in step.allowed_tools:
+            return f"tool '{name}' is not allowed for plan step '{step.id}'"
+        if name in {"write_file", "patch_file"} and step.allowed_paths:
+            raw_path = str((args or {}).get("path", "")).strip()
+            try:
+                relative = self.path(raw_path).relative_to(self.root).as_posix()
+            except (ValueError, KeyError):
+                return f"path '{raw_path}' is outside the workspace"
+            if not self._plan_path_matches(relative, step.allowed_paths):
+                return f"path '{relative}' is outside plan step '{step.id}' allowed_paths"
+        return ""
+
+    def _record_plan_tool_event(self, name, result):
+        if self.plan_graph is None or self.plan_state is None or not self.plan_state.current_step:
+            return
+        self._advance_plan(
+            PlanEvent(
+                kind="tool_executed",
+                step_id=self.plan_state.current_step,
+                summary=f"{name}: {clip(result, 300)}",
+            )
+        )
+
+    def verify_plan_step(self, step):
+        """Run step-level read-only checks through the AntProof approval boundary."""
+        checks = []
+        for index, command in enumerate(step.verification_commands, start=1):
+            check = ProofCheck(
+                check_id=f"plan_{step.id}_{index}",
+                command=command,
+                timeout=step.verification_timeout,
+                required=True,
+            )
+            checks.append(self.proof_engine._run_check(check))
+        return all(item.get("status") == "passed" for item in checks), checks
 
     def validate_tool(self, name, args):
         """把通用工具校验和 runtime 级额外约束串起来。"""
